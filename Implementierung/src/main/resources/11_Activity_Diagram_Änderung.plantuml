@@ -1,0 +1,331 @@
+@startuml AD2_Sitzplatz_Aendern_v3_Final_Fixed
+
+' Titel
+title Activity Diagram AD2 - Sitzplatz ändern (v3)\n(Freigabe alter Sitzplatz + Zuweisung neuer Sitzplatz)
+
+' Styling
+skinparam activityBackgroundColor WhiteSmoke
+skinparam activityBorderColor DarkSlateGray
+skinparam activityDiamondBackgroundColor LightYellow
+skinparam activityDiamondBorderColor Orange
+skinparam activityStartColor LightSkyBlue
+skinparam activityEndColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam partitionBorderColor Navy
+skinparam partitionBackgroundColor AliceBlue
+
+' === Swimlanes ===
+|Agent|
+start
+
+:Wähle "Sitzplatz ändern"\nfür Passagier;
+
+note right
+  **Traceability:** F-05, F-06
+  
+  Agent initiiert Sitzplatzänderung
+  für bereits eingecheckten Passagier.
+  
+  Datum: 2025-11-14 14:38:40
+  User: LuBre22
+end note
+
+|System (SitzplatzService)|
+
+:Lade aktuelle Zuweisung\n(alter Sitzplatz);
+
+note right
+  System ermittelt:
+  • passenger_id
+  • old_seat_number
+  • old_cabin_class
+  
+  SELECT * FROM assignments
+  WHERE passenger_id=?
+end note
+
+' === Prüfung ob Zuweisung existiert ===
+if (Zuweisung\nexistiert?) then (Ja)
+  
+  note right
+    Passagier hat bereits
+    einen zugewiesenen Sitzplatz.
+    Änderung kann durchgeführt werden.
+  end note
+  
+else (Nein)
+  
+  note right
+    **Fehlerfall:**
+    Passagier hat noch keinen
+    Sitzplatz zugewiesen.
+    
+    Änderung nicht möglich.
+  end note
+  
+  |Agent|
+  
+  #LightCoral:Fehlermeldung:\n"Passagier hat noch keinen\nSitzplatz zugewiesen.\nBitte zuerst Check-in durchführen.";
+  
+  stop
+  
+endif
+
+|UI (Sitzplan)|
+
+:Zeige Sitzplan mit\nverfügbaren Plätzen\n(derselben Klasse);
+
+note right
+  **Traceability:** N-05
+  
+  Sitzplan-Visualisierung:
+  • <color:green>Grün</color> = AVAILABLE
+  • <color:red>Rot</color> = ASSIGNED
+  • <color:gold>Gelb</color> = RESERVED
+  • <color:gray>Grau</color> = BLOCKED
+  
+  **Filter:** Nur Sitze mit
+  cabin_class = old_cabin_class anzeigen.
+end note
+
+|Agent|
+
+:Wähle neuen Sitzplatz aus;
+
+|System (SitzplatzService)|
+
+' === Validierung Kabinenklasse ===
+:Validiere:\nNeuer Sitzplatz in\nderselben cabin_class;
+
+note right
+  **Constraint F-05:**
+  
+  Prüfung: new_seat.cabin_class == old_cabin_class
+  
+  Sitzplatzänderung ist nur innerhalb
+  derselben Klasse erlaubt.
+  
+  Für Klassenwechsel (Upgrade)
+  ist Supervisor-Autorisierung
+  erforderlich (siehe UC3, AD3).
+end note
+
+if (Klasse\nidentisch?) then (Ja)
+  
+  ' weiter zur ACID-Transaktion
+  
+else (Nein)
+  
+  note right
+    **Fehlerfall:**
+    Neuer Sitzplatz gehört zu
+    anderer Kabinenklasse.
+    
+    Änderung verweigert (F-05).
+  end note
+  
+  |Agent|
+  
+  #LightCoral:Fehlermeldung:\n"Klassenwechsel nicht erlaubt.\nAktuell: {old_cabin_class}\nGewählt: {new_cabin_class}\n\nFür Upgrades wenden Sie sich\nan einen Supervisor.";
+  
+  stop
+  
+endif
+
+partition "**Critical Region (ACID-Transaktion)** <<critical>>" #LightGray {
+  
+  note right
+    **Traceability:** F-03, N-02
+    
+    ACID-Transaktion (SERIALIZABLE)
+    verhindert Race Conditions:
+    • Atomare Freigabe + Zuweisung
+    • Keine Zwischenzustände
+    • SELECT FOR UPDATE Lock
+  end note
+  
+  |Database|
+  
+  :BEGIN TRANSACTION\n(SERIALIZABLE);
+  
+  |System (SitzplatzService)|
+  
+  :Prüfe Verfügbarkeit\nneuer Sitzplatz\n(SELECT FOR UPDATE);
+  
+  note right
+    SELECT * FROM seats
+    WHERE seat_number=new_seat
+    AND cabin_class=old_cabin_class
+    FOR UPDATE
+    
+    Exklusiver Lock verhindert
+    parallele Änderungen (F-03).
+  end note
+  
+  if (Neuer Sitzplatz\nverfügbar?) then (Ja)
+    
+    |Database|
+    
+    :Setze alten Sitzplatz\n→ AVAILABLE;
+    
+    note right
+      **Traceability:** F-06
+      
+      UPDATE seats
+      SET status='AVAILABLE'
+      WHERE seat_number=old_seat
+      
+      Alter Sitzplatz wird freigegeben.
+    end note
+    
+    :Setze neuen Sitzplatz\n→ ASSIGNED;
+    
+    note right
+      UPDATE seats
+      SET status='ASSIGNED'
+      WHERE seat_number=new_seat
+    end note
+    
+    :Aktualisiere Zuweisung\n(Audit-Attribute);
+    
+    note right
+      **Audit-Attribute (Compliance):**
+      
+      UPDATE assignments SET
+      • seat_number=new_seat
+      • mitarbeiter_id='LuBre22' (wer)
+      • zeitstempel='2025-11-14 14:38:40' (wann)
+      • grund='MANUELL' (warum)
+      WHERE passenger_id=?
+      
+      Historie der Änderung wird
+      festgehalten (DSGVO-relevant).
+    end note
+    
+    :COMMIT;
+    
+    |System (SitzplatzService)|
+    
+    :Aktualisiere Bordkarte\nmit neuem Sitzplatz;
+    
+    note right
+      BordkartenService.update_boarding_pass()
+      • Neuer Sitzplatz auf Bordkarte
+      • Zeitstempel der Änderung
+      • QR-Code aktualisieren
+    end note
+    
+    |Agent|
+    
+    #LightGreen:Bestätigung:\n"Sitzplatz erfolgreich geändert:\n{old_seat} → {new_seat}\nKlasse: {cabin_class}";
+    
+  else (Nein)
+    
+    note right
+      **Traceability:** F-03
+      
+      Race Condition:
+      Neuer Sitzplatz wurde zwischen
+      Anzeige und Auswahl von anderem
+      Agent zugewiesen.
+    end note
+    
+    |Database|
+    
+    :ROLLBACK;
+    
+    note right
+      Transaktion wird zurückgerollt:
+      • Alter Sitzplatz bleibt ASSIGNED
+      • Keine Änderung durchgeführt
+      • Datenbank-Konsistenz gewahrt
+    end note
+    
+    |Agent|
+    
+    #LightCoral:Fehlermeldung:\n"Sitzplatz {new_seat}\nbereits vergeben.\n\nBitte anderen Sitzplatz wählen.";
+    
+  endif
+  
+}
+
+' === Single Exit Point Note ===
+note right
+  **Single Exit Point (P-05)**
+  
+  Alle Pfade (Erfolg/Fehler) enden
+  in einem gemeinsamen Endknoten.
+  
+  Fehler-Pfade:
+  • Zuweisung existiert nicht
+  • Klassenwechsel nicht erlaubt
+  • Race Condition (neuer Sitz belegt)
+  
+  Erfolgs-Pfad:
+  • Sitzplatzänderung erfolgreich
+  
+  Dies entspricht UML-Best-Practice (P-05)
+  und Plan-Anforderung für AD2.
+  
+  **Änderungshistorie v3:**
+  • Kritik 1 (zweite Iteration): Single Exit Point
+  • Alle Pfade enden in gemeinsamem stop
+  • PlantUML-Syntax korrigiert (Merge-Knoten)
+end note
+
+stop
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-03: Doppelzuweisung verhindern (ACID)
+  • F-05: Sitzplatz ändern (innerhalb derselben Klasse)
+  • F-06: Alter Sitzplatz freigeben
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  • N-05: Sitzplan-Visualisierung
+  
+  ---
+  
+  **Sitzplatz-Status:**
+  • <color:green>AVAILABLE</color> = Frei
+  • <color:red>ASSIGNED</color> = Zugewiesen
+  • <color:gold>RESERVED</color> = Temporär reserviert
+  • <color:gray>BLOCKED</color> = Blockiert
+  
+  ---
+  
+  **Swimlanes:**
+  • Agent: Menschlicher Akteur (LuBre22)
+  • System (SitzplatzService): Business-Logik
+  • UI (Sitzplan): Visualisierung (Boundary)
+  • Database: Persistenz-Schicht
+  
+  ---
+  
+  **Besonderheiten:**
+  • **Critical Region:** ACID-Transaktion
+    mit SELECT FOR UPDATE verhindert
+    Race Conditions (F-03)
+  • **Audit-Attribute:** mitarbeiter_id,
+    zeitstempel, grund=MANUELL
+  • **Atomare Operation:** Freigabe alter
+    + Zuweisung neuer Sitzplatz in EINER
+    Transaktion (keine Zwischenzustände)
+  • **Single Exit Point (P-05):** Alle Pfade
+    führen zu einem gemeinsamen Endknoten
+  • **Constraint F-05:** Änderung nur
+    innerhalb derselben Kabinenklasse
+  
+  ---
+  
+  **Änderungen v2 → v3 (2025-11-14 14:38:40):**
+  • Kritik 1 (zweite Iteration): Single Exit Point
+  • Alle Pfade enden in gemeinsamem stop
+  • PlantUML-Syntax korrigiert
+  
+  **Erstellt:** 2025-11-14 14:38:40 UTC
+  **User:** LuBre22
+end legend
+
+@enduml

@@ -1,0 +1,493 @@
+@startuml Class_Diagram_Sitzplatzverwaltung
+
+' Titel
+title Class Diagram - Sitzplatzverwaltung am Check-in-Schalter\n(Airbus A350-900, LHR→SIN) - Version 4
+
+' Styling
+skinparam classBackgroundColor WhiteSmoke
+skinparam classBorderColor DarkSlateGray
+skinparam stereotypeCBackgroundColor LightYellow
+skinparam packageStyle rectangle
+skinparam arrowColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+
+' === Enumerationen ===
+enum CabinClass {
+  Business
+  PremiumEconomy
+  Economy
+}
+
+enum SeatStatus {
+  AVAILABLE
+  RESERVED
+  ASSIGNED
+  BLOCKED
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  EXPIRED
+  COMPLETED
+}
+
+enum AssignmentReason {
+  AUTOMATISCH
+  MANUELL
+  UPGRADE
+}
+
+enum EmployeeRole {
+  CheckInAgent
+  Supervisor
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum SagaStatus {
+  STARTED
+  COMPENSATED
+  COMPLETED
+}
+
+enum OrchestratorState {
+  IDLE
+  RESERVING
+  PAYING
+  COMMITTING
+  ROLLBACK_PENDING
+}
+
+' === Entitäten (Core Domain) ===
+class Sitzplatz <<entity>> {
+  - seat_number : String {id}
+  - cabin_class : CabinClass
+  - status : SeatStatus
+  - row : Integer
+  - column : String
+  __
+  + invariant: status IN (AVAILABLE, RESERVED, ASSIGNED, BLOCKED)
+}
+
+class Reservierung <<entity>> {
+  - reservation_id : UUID {id}
+  - seat_number : String {fk}
+  - ttl_expires_at : DateTime
+  - status : ReservationStatus
+  __
+  + invariant: ttl_expires_at > now() OR status IN (EXPIRED, COMPLETED)
+  + invariant: (status = PENDING => Sitzplatz.status = RESERVED)
+  + invariant: (status = EXPIRED => Sitzplatz.status = AVAILABLE)
+}
+
+class Zuweisung <<entity>> {
+  - assignment_id : UUID {id}
+  - passenger_id : String {fk}
+  - seat_number : String {fk}
+  - mitarbeiter_id : String {fk}
+  - zeitstempel : DateTime
+  - grund : AssignmentReason
+  - correlation_id : UUID {optional}
+  __
+  + invariant: mitarbeiter_id NOT NULL AND zeitstempel NOT NULL
+}
+
+class Mitarbeiter <<entity>> {
+  - mitarbeiter_id : String {id}
+  - name : String
+  - rolle : EmployeeRole
+}
+
+class SagaLog <<entity>> {
+  - saga_id : UUID {id}
+  - step : String
+  - status : SagaStatus
+  - timestamp : DateTime
+}
+
+' === Externe Entitäten ===
+class Passagier <<external, encrypted>> {
+  - passenger_id : String {id}
+  - name : String
+  - booking_reference : String
+}
+
+class Buchung <<external, encrypted>> {
+  - booking_id : String {id}
+  - cabin_class : CabinClass
+  - pnr : String
+}
+
+class ZahlungsAuthorisierung <<external>> {
+  - auth_id : UUID {id}
+  - amount : Decimal
+  - status : PaymentStatus
+  - correlation_id : UUID
+}
+
+' === Timer ===
+class TTLTimer <<timer>> {
+  - timer_id : UUID
+  - reservation_id : UUID {fk}
+  - expires_at : DateTime
+  __
+  + trigger_expiration()
+}
+
+' === Services ===
+class SitzplatzService <<control>> {
+  + assign_seat(passenger_id, seat_number, mitarbeiter_id, zeitstempel, grund, correlation_id)
+  + change_seat(passenger_id, old_seat, new_seat, mitarbeiter_id, zeitstempel) : boolean
+  + check_availability(seat_number) : Boolean
+  + release_seat(seat_number)
+  __
+  **NEU v4: Wrapper für SD1/SD2-Konsistenz**
+  + check_existing_assignment(passenger_id) : Optional<Zuweisung>
+  + get_available_seats(cabin_class) : List<Sitzplatz>
+  + assign_seat_auto(passenger_id, cabin_class, mitarbeiter_id, zeitstempel, correlation_id)
+  + get_current_assignment(passenger_id) : Optional<Zuweisung>
+}
+
+class UpgradeSagaOrchestrator <<control>> {
+  + reserve_and_pay(passenger_id, old_seat, target_seat, mitarbeiter_id) : Result
+  + compensate(reservation_id)
+  + commit_upgrade(reservation_id, passenger_id, old_seat, target_seat, mitarbeiter_id)
+  __
+  - state : OrchestratorState
+}
+
+class BordkartenService <<control>> {
+  + generate_boarding_pass(passenger_id, seat_number, cabin_class) : BoardingPass
+  + update_boarding_pass(passenger_id, new_seat) : BoardingPass
+  + generate_boarding_pass_no_seat(passenger_id, cabin_class, reason) : BoardingPass
+}
+
+class ZahlungsClient <<control>> {
+  + authorize_payment(upgrade_fee, correlation_id) : PaymentResult
+  + check_payment_status(payment_id) : PaymentStatus
+}
+
+' === Boundary ===
+class SitzplanVisualisierung <<boundary>> {
+  + render_seat_map(flight_id) : List<Sitzplatz>
+  + get_seat_status(seat_number) : SeatStatus
+  + highlight_available_seats(cabin_class) : List<Sitzplatz>
+}
+
+' === Beziehungen (Assoziationen) ===
+Buchung "1" -- "0..1" Zuweisung : hat >
+Sitzplatz "1" -- "0..1" Reservierung : temporär_reserviert >
+Reservierung --> Sitzplatz : seat_number
+Sitzplatz "1" -- "0..1" Zuweisung : final_zugewiesen >
+Zuweisung "*" -- "1" Mitarbeiter : zugewiesen_durch >
+Reservierung "1" -- "1" ZahlungsAuthorisierung : linked_to >
+Reservierung "1" -- "1" TTLTimer : expires_via >
+
+' === Abhängigkeiten (Services zu Entitäten) ===
+SitzplatzService ..> Sitzplatz : <<uses>>
+SitzplatzService ..> Zuweisung : <<uses>>
+SitzplatzService ..> Mitarbeiter : <<uses>>
+
+UpgradeSagaOrchestrator ..> Reservierung : <<orchestrates>>
+UpgradeSagaOrchestrator ..> SagaLog : <<logs>>
+UpgradeSagaOrchestrator ..> Sitzplatz : <<uses>>
+UpgradeSagaOrchestrator ..> Zuweisung : <<uses>>
+UpgradeSagaOrchestrator ..> TTLTimer : <<manages>>
+UpgradeSagaOrchestrator ..> ZahlungsClient : <<invokes>>
+UpgradeSagaOrchestrator ..> BordkartenService : <<invokes>>
+
+SitzplatzService ..> BordkartenService : <<invokes>>
+
+ZahlungsClient ..> ZahlungsAuthorisierung : <<creates>>
+
+SitzplanVisualisierung ..> Sitzplatz : <<reads>>
+SitzplanVisualisierung ..> Reservierung : <<reads>>
+
+' === Notizen ===
+note right of Sitzplatz
+  **Traceability:** F-01, F-03, N-05
+  
+  Kern-Domänenobjekt für Sitzplätze.
+  Status wird nur mit AVAILABLE, RESERVED, 
+  ASSIGNED, BLOCKED persistiert.
+  
+  **Hinweis:** Zustände ASSIGNING und 
+  ROLLBACK_PENDING existieren nur im 
+  UpgradeSagaOrchestrator.state 
+  (nicht in diesem Enum).
+end note
+
+note right of Reservierung
+  **Traceability:** F-08
+  
+  Temporäres Koordinationsobjekt für 
+  Upgrade-Flow mit TTL-basierter Gültigkeit.
+  
+  **Status-Mapping:**
+  • PENDING ↔ Sitzplatz.status = RESERVED
+  • CONFIRMED ↔ Sitzplatz.status = ASSIGNED 
+    (ephemeral, vor DELETE)
+  • EXPIRED ↔ Sitzplatz.status = AVAILABLE 
+    (nach Timeout)
+  • COMPLETED ↔ Erfolgreicher Upgrade 
+    (anschließend DELETE oder Cleanup-Job)
+  
+  **Invariante (P-04):**
+  Synchronität mit Sitzplatz.status 
+  muss gewahrt bleiben.
+end note
+
+note right of Zuweisung
+  **Traceability:** F-01, F-02, F-05, Compliance
+  
+  **Audit-Attribute (DSGVO-relevant):**
+  • mitarbeiter_id: Wer hat zugewiesen?
+  • zeitstempel: Wann wurde zugewiesen?
+  • grund: Warum? (AUTOMATISCH, MANUELL, UPGRADE)
+  
+  **NEU v3: correlation_id (optional):**
+  • Für Idempotenz bei Retries (F-03)
+  • Verhindert Doppelzuweisungen bei Netzwerkfehlern
+  • NULL bei normaler Zuweisung
+  
+  Diese Felder sind NOT NULL (Invariante) 
+  und dienen der Nachvollziehbarkeit.
+end note
+
+note left of Passagier
+  **Traceability:** N-04
+  
+  <<encrypted>> Stereotyp kennzeichnet:
+  Attribute werden gemäß N-04 verschlüsselt
+  • at-rest: AES-256
+  • in-transit: TLS 1.2+
+  
+  Read-Only von Buchungssystem.
+end note
+
+note left of Buchung
+  **Traceability:** F-01, F-04, N-04
+  
+  <<encrypted>> Stereotyp kennzeichnet:
+  Attribute werden gemäß N-04 verschlüsselt.
+  
+  Read-Only von Buchungssystem.
+end note
+
+note bottom of UpgradeSagaOrchestrator
+  **Traceability:** F-07, F-08, N-07
+  
+  Orchestriert Reservierung und protokolliert 
+  in SagaLog.
+  
+  **Interne Zustände (OrchestratorState):**
+  • IDLE: Kein aktiver Upgrade-Prozess
+  • RESERVING: Temporäre Reservierung erstellt
+  • PAYING: Zahlungsanfrage läuft
+  • COMMITTING: Atomare ACID-Transaktion 
+    (release_old_seat + assign_new_seat)
+  • ROLLBACK_PENDING: Kompensation läuft
+  
+  Diese Zustände sind NICHT in Sitzplatz.status 
+  persistiert (siehe Enum OrchestratorState).
+  
+  **Synchronisation bei Parallelität:**
+  Gleichzeitige Änderung/Upgrade desselben 
+  Passagiers wird durch Correlation-ID + 
+  Idempotenz verhindert (außerhalb UML-Scope).
+end note
+
+note bottom of TTLTimer
+  **Traceability:** F-08
+  
+  Zeitbasiertes Event-Management für 
+  Reservierungs-Timeouts (120 Sekunden).
+  
+  Bei Ablauf: Trigger an 
+  UpgradeSagaOrchestrator → 
+  auto_compensate() → 
+  Reservierung.status = EXPIRED
+end note
+
+note right of SagaLog
+  **Traceability:** N-07
+  
+  Audit-Log für Saga-Transaktionen.
+  Protokolliert jeden Schritt des 
+  Upgrade-Prozesses für Debugging 
+  und Compliance.
+end note
+
+note bottom of SitzplatzService
+  **Traceability:** F-01, F-02, F-05, SD1, SD2
+  
+  Zentrale Business-Logik für:
+  • Automatische/Manuelle Zuweisung (F-01, F-02)
+  • Änderung innerhalb Klasse (F-05)
+  • Verfügbarkeitsprüfung
+  
+  Alle Operationen nutzen ACID-Transaktionen 
+  (N-02: SERIALIZABLE Isolation Level).
+  
+  **NEU v4: Wrapper-Methoden**
+  Die vier zusätzlichen Methoden 
+  (check_existing_assignment, get_available_seats,
+  assign_seat_auto, get_current_assignment) dienen
+  der Konsistenz mit Sequenzdiagrammen SD1/SD2.
+  
+  Sie sind reine Delegations-Wrapper ohne zusätzliche
+  Business-Logik und erfüllen die Aufgabenstellung
+  "strikte Konsistenz zu ALLEN UML-Diagrammen".
+end note
+
+note right of SitzplanVisualisierung
+  **Traceability:** N-05
+  
+  UI-Komponente für grafische Darstellung.
+  
+  Rückgabetypen sind Domänenobjekte 
+  (List<Sitzplatz>), keine DTOs.
+  Mapping zu UI-Format erfolgt in 
+  Präsentationsschicht (außerhalb Scope).
+  
+  **NEU v4: render_seat_map**
+  Gibt ALLE Sitzplätze zurück (nicht nur AVAILABLE),
+  um vollständige Status-Visualisierung zu ermöglichen.
+  Nutzt intern SitzplatzRepository.find_all_seats().
+end note
+
+note left of OrchestratorState
+  **Traceability:** F-08, N-07
+  
+  Interner Zustand des Saga-Orchestrators.
+  
+  Diese Zustände sind NICHT in 
+  Sitzplatz.status-Enum enthalten.
+  Für andere Transaktionen bleibt 
+  der Sitzplatz während PAYING/COMMITTING 
+  im Zustand RESERVED (geschützt).
+end note
+
+note right of BordkartenService
+  **Traceability:** F-01, F-04, F-07
+  
+  Generiert und aktualisiert Bordkarten.
+  
+  **Methoden:**
+  • generate_boarding_pass(): 
+    Normale Zuweisung (SD1, F-01/F-02)
+  • generate_boarding_pass_no_seat(): 
+    Überbuchung (SD1, F-04)
+  • update_boarding_pass(): 
+    Änderung/Upgrade (SD2, SD4)
+end note
+
+note right of ZahlungsClient
+  **Traceability:** F-08
+  
+  Adapter für externes Zahlungssystem.
+  
+  Abstrahiert Payment-API und erstellt
+  ZahlungsAuthorisierung-Objekte mit
+  Correlation-ID für Idempotenz.
+  
+  Wird von UpgradeSagaOrchestrator genutzt.
+  
+  **check_payment_status:**
+  Für zukünftige Polling-Unterstützung;
+  aktuell nicht im Orchestrator-Flow genutzt
+  (SD4 zeigt nur authorize_payment).
+end note
+
+' === Aggregatsgrenzen ===
+note as AggregateNote
+  **Aggregatsgrenze: Sitzplatz-Aggregat**
+  
+  Aggregate Root: **Sitzplatz**
+  Entitäten: Sitzplatz, Reservierung, Zuweisung
+  
+  Invarianten:
+  • Nur 1 Reservierung pro Sitzplatz (0..1)
+  • Nur 1 Zuweisung pro Sitzplatz (0..1)
+  • Reservierung und Zuweisung schließen sich aus 
+    (entweder/oder, nie beide gleichzeitig)
+end note
+
+AggregateNote -[hidden]right- Sitzplatz
+
+note as RepositoryNote
+  **SitzplatzRepository (implizit, nicht dargestellt)**
+  
+  Kapselt Persistenz-Operationen:
+  • find_available_seats(cabin_class)
+  • find_all_seats() **NEU v4**
+  • check_and_lock_seat(seat_number)
+  • lock_seat(seat_number)
+  • unlock_seat(seat_number)
+  • assign_seat(...)
+  • release_seat(seat_number)
+  • set_seat_status(seat_number, status)
+  • update_assignment(...)
+  • find_assignment_by_passenger(passenger_id)
+  • get_seat(seat_number)
+  • find_by_correlation_id(correlation_id)
+  
+  **find_all_seats()** gibt alle Sitzplätze zurück
+  (unabhängig vom Status) für vollständige
+  Sitzplan-Visualisierung (N-05).
+end note
+
+RepositoryNote -[hidden]down- Sitzplatz
+
+' === Legende ===
+legend right
+  **Kardinalitäten:**
+  • 0..1 = optional (vor Check-in nicht vorhanden)
+  • 1 = verpflichtend
+  • * = beliebig viele
+  
+  **Stereotypen:**
+  • <<entity>> – Domänenobjekte (persistent)
+  • <<external>> – Externe Systeme (Read-Only)
+  • <<encrypted>> – Verschlüsselte Attribute (N-04)
+  • <<control>> – Services/Orchestrator
+  • <<boundary>> – UI-Komponenten
+  • <<timer>> – Zeitbasierte Events
+  
+  **Beziehungen:**
+  • —— Assoziation (bidirektional oder navigierbar)
+  • ..> Abhängigkeit (uses, invokes, reads, creates)
+  
+  **Invarianten:**
+  OCL-Notation für Geschäftsregeln
+  
+  **NEU in v3:**
+  • BordkartenService (<<control>>)
+  • ZahlungsClient (<<control>>)
+  • correlation_id in Zuweisung (optional)
+  
+  **NEU in v4:**
+  • SitzplatzService: 4 Wrapper-Methoden
+    (check_existing_assignment, get_available_seats,
+    assign_seat_auto, get_current_assignment)
+  • change_seat: Rückgabetyp `: boolean`
+  • SitzplatzRepository: find_all_seats()
+    (dokumentiert in separater Notiz)
+  • Erweiterte Notizen für Konsistenz mit SD1/SD2
+  
+  **Änderungshistorie v4 (2025-11-15):**
+  • Wrapper-Methoden hinzugefügt für strikte
+    Konsistenz mit Sequenzdiagrammen SD1/SD2
+  • Rückgabetyp boolean für change_seat präzisiert
+  • Repository-Methode find_all_seats dokumentiert
+  • Notizen erweitert für Traceability
+  • User: LuBre22
+end legend
+
+@enduml

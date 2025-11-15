@@ -1,0 +1,446 @@
+@startuml AD1_Sitzplatz_Zuweisen_v3_Final
+
+' Titel
+title Activity Diagram AD1 - Sitzplatz zuweisen (v3)\n(automatisch oder manuell mit Überbuchungs-Fallback)
+
+' Styling
+skinparam activityBackgroundColor WhiteSmoke
+skinparam activityBorderColor DarkSlateGray
+skinparam activityDiamondBackgroundColor LightYellow
+skinparam activityDiamondBorderColor Orange
+skinparam activityStartColor LightSkyBlue
+skinparam activityEndColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam partitionBorderColor Navy
+skinparam partitionBackgroundColor AliceBlue
+
+' === Swimlanes ===
+|Agent|
+start
+
+:Gebe Passagier-ID ein;
+
+note right
+  **Traceability:** F-01, F-02
+  
+  Agent startet Check-in-Prozess
+  für Passagier.
+  
+  Datum: 2025-11-14 14:16:24
+  User: LuBre22
+end note
+
+|System (SitzplatzService)|
+
+:Fordere Passagierdaten an;
+
+note right
+  **Traceability:** F-01, N-04
+  
+  GET /bookings/{passenger_id}
+  
+  Request an externes Buchungssystem
+  für verschlüsselte Passagierdaten.
+end note
+
+|Buchungssystem|
+
+:Liefere Passagierdaten\n(verschlüsselt);
+
+note right
+  **Traceability:** N-04
+  
+  Daten (verschlüsselt):
+  • passenger_id
+  • name
+  • pnr (Booking Reference)
+  • cabin_class
+  • booking_status
+  
+  <<external, encrypted>>
+  AES-256 at-rest, TLS 1.2+ in-transit
+end note
+
+|System (SitzplatzService)|
+
+' === Prüfung Passagier existiert ===
+if (Passagier\ngefunden?) then (Ja)
+  
+  ' === Prüfung Buchung gültig ===
+  :Validiere Buchungsstatus;
+  
+  note right
+    Prüfung:
+    • booking_status NOT IN ('CANCELLED', 'EXPIRED')
+    • booking_date <= flight_date
+    • payment_status = 'CONFIRMED'
+    
+    Verhindert Check-in mit
+    stornierten/abgelaufenen Buchungen.
+  end note
+  
+  if (Buchung\ngültig?) then (Ja)
+    
+    :Prüfe vorab zugewiesenen\nSitzplatz;
+    
+    note right
+      SELECT * FROM assignments
+      WHERE passenger_id=?
+      
+      Prüfung, ob Passagier bereits
+      Sitzplatz hat (z. B. durch
+      Online-Check-in).
+    end note
+    
+    ' === Prüfung: Bereits zugewiesen? ===
+    if (Sitzplatz bereits\nzugewiesen?) then (Ja)
+      
+      note right
+        Passagier hat bereits Sitzplatz
+        (z. B. bei Online-Check-in).
+        
+        Kein weiterer Prozess nötig.
+      end note
+      
+      |Agent|
+      
+      #LightGreen:Bestätigung:\n"Sitzplatz bereits zugewiesen:\n{seat_number}\nKlasse: {cabin_class}";
+      
+      stop
+      
+    else (Nein)
+      
+      ' === Entscheidung: Auto vs. Manuell ===
+      |Agent|
+      
+      :Wähle Zuweisungsmodus:\nAutomatisch oder Manuell?;
+      
+      note right
+        Agent entscheidet:
+        • Automatisch (F-01):
+          System wählt ersten verfügbaren
+          Sitzplatz in gebuchter Klasse
+        • Manuell (F-02):
+          Agent wählt Sitzplatz aus
+          Sitzplan-Visualisierung (N-05)
+      end note
+      
+      if (Modus?) then (Automatisch)
+        
+        note right
+          **Traceability:** F-01
+          
+          Automatische Zuweisung:
+          System wählt ersten verfügbaren
+          Sitzplatz in gebuchter Klasse.
+        end note
+        
+        |System (SitzplatzService)|
+        
+        :Suche ersten verfügbaren\nSitzplatz in cabin_class;
+        
+        note right
+          SELECT * FROM seats
+          WHERE cabin_class=?
+          AND status='AVAILABLE'
+          ORDER BY row, column
+          LIMIT 1
+          
+          Erste verfügbare Sitzreihe
+          wird bevorzugt.
+        end note
+        
+      else (Manuell)
+        
+        note right
+          **Traceability:** F-02, N-05
+          
+          Manuelle Zuweisung:
+          Agent wählt Sitzplatz aus
+          Sitzplan-Visualisierung.
+        end note
+        
+        |UI (Sitzplan)|
+        
+        :Zeige Sitzplan mit\nverfügbaren Plätzen;
+        
+        note right
+          **Traceability:** N-05
+          
+          Sitzplan-Visualisierung:
+          • <color:green>Grün</color> = AVAILABLE
+          • <color:red>Rot</color> = ASSIGNED
+          • <color:gold>Gelb</color> = RESERVED
+          • <color:gray>Grau</color> = BLOCKED
+          
+          Filter: cabin_class
+        end note
+        
+        |Agent|
+        
+        :Wähle Sitzplatz aus;
+        
+        |System (SitzplatzService)|
+        
+      endif
+      
+      ' === Prüfung: Sitzplätze verfügbar? ===
+      if (Sitzplätze\nverfügbar?) then (Ja)
+        
+        partition "**Critical Region (ACID-Transaktion)** <<critical>>" #LightGray {
+          
+          note right
+            **Traceability:** F-03, N-02
+            
+            ACID-Transaktion (SERIALIZABLE)
+            verhindert Doppelzuweisungen:
+            • SELECT FOR UPDATE Lock
+            • Atomare Zuweisung
+            • Audit-Attribute
+          end note
+          
+          |Database|
+          
+          :BEGIN TRANSACTION\n(SERIALIZABLE);
+          
+          |System (SitzplatzService)|
+          
+          :Prüfe und sperre Sitzplatz\n(SELECT FOR UPDATE);
+          
+          note right
+            SELECT * FROM seats
+            WHERE seat_number=?
+            AND status='AVAILABLE'
+            FOR UPDATE
+            
+            Exklusiver Lock verhindert
+            parallele Zuweisungen (F-03).
+          end note
+          
+          if (Sitzplatz noch\nverfügbar?) then (Ja)
+            
+            |Database|
+            
+            :Setze Sitzplatz\n→ ASSIGNED;
+            
+            note right
+              UPDATE seats
+              SET status='ASSIGNED'
+              WHERE seat_number=?
+            end note
+            
+            :Erstelle Zuweisung\n(Audit-Attribute);
+            
+            note right
+              **Audit-Attribute (Compliance):**
+              
+              INSERT INTO assignments (
+                passenger_id,
+                seat_number,
+                mitarbeiter_id='LuBre22' (wer),
+                zeitstempel='2025-11-14 14:16:24' (wann),
+                grund='AUTOMATISCH/MANUELL' (warum)
+              )
+              
+              Historie wird festgehalten
+              (DSGVO-relevant).
+            end note
+            
+            :COMMIT;
+            
+            |System (SitzplatzService)|
+            
+            :Generiere Bordkarte\nmit Sitzplatznummer;
+            
+            note right
+              BordkartenService.generate_boarding_pass()
+              • Sitzplatznummer
+              • Kabinenklasse
+              • Passagierdaten
+              • QR-Code
+            end note
+            
+            |Agent|
+            
+            #LightGreen:Bestätigung:\n"Sitzplatz zugewiesen:\n{seat_number}\nKlasse: {cabin_class}\nPassagier: {name}";
+            
+          else (Nein)
+            
+            note right
+              **Traceability:** F-03
+              
+              Race Condition:
+              Sitzplatz wurde zwischen
+              Prüfung und Lock-Erhalt
+              von anderem Agent zugewiesen.
+            end note
+            
+            |Database|
+            
+            :ROLLBACK;
+            
+            |Agent|
+            
+            #LightCoral:Fehlermeldung:\n"Sitzplatz {seat_number}\nbereits vergeben.\n\nBitte anderen Sitzplatz wählen\noder automatische Zuweisung nutzen.";
+            
+          endif
+          
+        }
+        
+      else (Nein)
+        
+        note right
+          **Traceability:** F-04
+          
+          Überbuchung:
+          Keine Sitzplätze in gebuchter
+          Klasse verfügbar.
+          
+          Alternative: Bordkarte mit
+          "Sitzplatz am Gate".
+        end note
+        
+        |System (SitzplatzService)|
+        
+        :Generiere Bordkarte\nohne Sitzplatznummer;
+        
+        note right
+          BordkartenService.
+          generate_boarding_pass_no_seat()
+          
+          **Wichtig:**
+          • Keine Sitzplatzzuweisung persistiert
+          • Sitzplätze bleiben AVAILABLE
+          • Bordkarte enthält:
+            - "Sitzplatz wird am Gate zugewiesen"
+            - Passagierdaten
+            - Kabinenklasse
+            - Hinweis: Priority Boarding
+        end note
+        
+        |Agent|
+        
+        #Orange:Warnung:\n"Überbuchung in {cabin_class}:\nKeine Sitzplätze verfügbar.\n\nBordkarte mit\n'Sitzplatz am Gate' ausgestellt.\n\nPassagier: {name}";
+        
+      endif
+      
+    endif
+    
+  else (Nein)
+    
+    note right
+      Buchung ist nicht gültig:
+      • Storniert (CANCELLED)
+      • Abgelaufen (EXPIRED)
+      • Zahlung ausstehend
+      
+      Check-in kann nicht durchgeführt werden.
+    end note
+    
+    |Agent|
+    
+    #LightCoral:Fehlermeldung:\n"Buchung nicht gültig:\nStatus: {booking_status}\n\nMögliche Ursachen:\n• Buchung storniert\n• Buchung abgelaufen\n• Zahlung ausstehend\n\nBitte Buchung überprüfen.";
+    
+    stop
+    
+  endif
+  
+else (Nein)
+  
+  note right
+    **Fehlerfall:**
+    Passagier nicht im Buchungssystem
+    gefunden.
+    
+    Mögliche Ursachen:
+    • Falsche Passagier-ID
+    • Keine Buchung vorhanden
+    • Systemfehler
+  end note
+  
+  |Agent|
+  
+  #LightCoral:Fehlermeldung:\n"Passagier nicht gefunden.\nPassagier-ID: {passenger_id}\n\nBitte Passagier-ID überprüfen.";
+  
+  stop
+  
+endif
+
+' === Multiple Exit Points ===
+note right
+  **Multiple Exit Points**
+  
+  Diagramm hat mehrere Endknoten (stop)
+  für verschiedene Fehler-/Erfolgspfade:
+  • Erfolgreiche Zuweisung
+  • Überbuchung (Warnung, aber kein Fehler)
+  • Sitzplatz bereits zugewiesen
+  • Buchung nicht gültig
+  • Passagier nicht gefunden
+  
+  Dies ist UML-konform für Activity Diagrams
+  mit Exception-Flows.
+  
+  **Änderungshistorie v3:**
+  • Kritik 1: Buchungssystem-Swimlane hinzugefügt
+  • Kritik 4: "Single Exit Point"-Note entfernt
+  • Kritik 5: Überbuchungs-Note klargestellt
+end note
+
+stop
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-01: Automatische Zuweisung
+  • F-02: Manuelle Zuweisung
+  • F-03: Doppelzuweisung verhindern (ACID)
+  • F-04: Check-in ohne Sitzplatz (Überbuchung)
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  • N-04: Verschlüsselte Passagierdaten
+  • N-05: Sitzplan-Visualisierung
+  
+  ---
+  
+  **Sitzplatz-Status:**
+  • <color:green>AVAILABLE</color> = Frei
+  • <color:red>ASSIGNED</color> = Zugewiesen
+  • <color:gold>RESERVED</color> = Temporär reserviert
+  • <color:gray>BLOCKED</color> = Blockiert
+  
+  ---
+  
+  **Swimlanes:**
+  • Agent: Menschlicher Akteur (LuBre22)
+  • System (SitzplatzService): Business-Logik
+  • Buchungssystem: Externes System (verschlüsselt)
+  • UI (Sitzplan): Visualisierung (Boundary)
+  • Database: Persistenz-Schicht
+  
+  ---
+  
+  **Besonderheiten:**
+  • **Critical Region:** ACID-Transaktion
+    mit SELECT FOR UPDATE (F-03)
+  • **Audit-Attribute:** mitarbeiter_id,
+    zeitstempel, grund (AUTOMATISCH/MANUELL)
+  • **Überbuchungs-Fallback:** Bordkarte
+    mit "Sitzplatz am Gate" (F-04)
+  • **Verschlüsselung:** Passagierdaten
+    (N-04: AES-256 at-rest, TLS 1.2+ in-transit)
+  • **Multiple Exit Points:** Mehrere stop-Knoten
+    für verschiedene Flows (UML-konform)
+  
+  ---
+  
+  **Änderungen v2 → v3 (2025-11-14 14:16:24):**
+  • Kritik 1 umgesetzt: Buchungssystem-Swimlane
+  • Kritik 4 umgesetzt: "Single Exit Point"-Note entfernt
+  • Kritik 5 umgesetzt: Überbuchungs-Note klargestellt
+  
+  **Erstellt:** 2025-11-14 14:16:24 UTC
+  **User:** LuBre22
+end legend
+
+@enduml

@@ -1,0 +1,226 @@
+@startuml State_Diagram_Sitzplatz
+
+' Titel
+title State Diagram - Lebenszyklus eines Sitzplatzes\n(Sitzplatzverwaltung am Check-in-Schalter)
+
+' Styling
+skinparam stateBorderColor DarkSlateGray
+skinparam stateBackgroundColor WhiteSmoke
+skinparam stateArrowColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+
+' === Farbcodierung für Zustände ===
+state AVAILABLE #90EE90 : AVAILABLE\nentry / initialize_seat()\nexit / log_state_change()
+state RESERVED #FFFF99 : RESERVED\nentry / set TTL=120s,\n       status=RESERVED\nexit / cancel_ttl_timer()
+state ASSIGNING #FFD700 : ASSIGNING\n(Orchestrator-Zustand)\nentry / initiate_payment()\ndo / await_payment_response()\nexit / finalize_payment_state()
+state ASSIGNED #FFB6C1 : ASSIGNED\nentry / commit_to_db(),\n       generate_audit_log()\nexit / mark_as_changed()
+state BLOCKED #D3D3D3 : BLOCKED\nentry / set_maintenance_flag()\nexit / clear_maintenance_flag()
+state ROLLBACK_PENDING #FFA07A : ROLLBACK_PENDING\n(Orchestrator-Zustand)\nentry / log_saga_failure(),\n       prepare_compensation()\nexit / cleanup_saga_state()
+
+' === Zustandsübergänge ===
+
+[*] --> AVAILABLE : initial
+
+' === Normal Assignment Flow ===
+AVAILABLE --> ASSIGNED : assign_seat()\n[seat_available AND no_reservation]\nTraceability: F-01, F-02
+
+note right of AVAILABLE
+  Traceability: F-01, F-02, F-05
+  
+  Initialer Zustand nach Flugzeug-Setup.
+  Sitzplatz ist frei und kann:
+  • Direkt zugewiesen werden (F-01/F-02)
+  • Reserviert werden (F-08, Upgrade)
+  • Blockiert werden (Wartung/VIP)
+end note
+
+' === Upgrade Flow (Reserve-Payment-Confirm) ===
+AVAILABLE --> RESERVED : reserve()\n[seat_available]\nTraceability: F-08
+
+note right of RESERVED
+  Traceability: F-08
+  
+  Temporäre Reservierung für Upgrade.
+  TTL=120s ab Erstellung.
+  
+  Status: RESERVED (gelb)
+  
+  Parallele Zustände:
+  • Sitzplatz.status = RESERVED
+  • Reservierung.status = PENDING
+end note
+
+RESERVED --> ASSIGNING : initiate_payment()\n[supervisor_authorized]\nTraceability: F-08, N-06
+
+note right of ASSIGNING
+  Traceability: F-08, N-07
+  
+  WICHTIG: Dies ist ein
+  interner Orchestrator-Zustand
+  (UpgradeSagaOrchestrator.state)
+  
+  Sitzplatz.status bleibt RESERVED!
+  
+  Für andere Transaktionen ist
+  der Sitzplatz weiterhin RESERVED
+  (geschützt durch Reservierung).
+end note
+
+ASSIGNING --> ASSIGNED : [payment_success AND within_ttl]\nTraceability: F-07, F-08
+
+ASSIGNING --> ROLLBACK_PENDING : [payment_failed]\nTraceability: N-07
+
+note left of ROLLBACK_PENDING
+  Traceability: N-07
+  
+  WICHTIG: Dies ist ein
+  interner Orchestrator-Zustand
+  (UpgradeSagaOrchestrator.state)
+  
+  Saga-Kompensation läuft:
+  • Reservierung löschen
+  • Sitzplatz freigeben
+  • SagaLog aktualisieren
+end note
+
+ROLLBACK_PENDING --> AVAILABLE : compensate()\n[atomic]\nentry / delete_reservation()
+
+' === Timeout Flow ===
+RESERVED --> AVAILABLE : [after(120s) AND payment_not_started]\nentry / auto_compensate(),\n       set reservation.status=EXPIRED\nTraceability: F-08
+
+note bottom of RESERVED
+  Timeout-Behandlung:
+  
+  Wenn 120s vergehen ohne
+  Zahlungsinitiierung:
+  • TTLTimer trigger_expiration()
+  • Reservierung.status = EXPIRED
+  • Sitzplatz wird AVAILABLE
+  
+  Atomare Operation verhindert
+  Race Conditions.
+end note
+
+' === Seat Change Flow ===
+ASSIGNED --> AVAILABLE : change_seat()\n[passenger_reassignment]\nentry / release_for_reassignment\nTraceability: F-05, F-06
+
+note right of ASSIGNED
+  Traceability: F-01, F-02, F-05, F-07
+  
+  Finaler Zustand nach erfolgreicher
+  Zuweisung (automatisch, manuell,
+  oder Upgrade).
+  
+  Status: ASSIGNED (rot)
+  
+  Audit-Attribute persistiert:
+  • mitarbeiter_id (wer)
+  • zeitstempel (wann)
+  • grund (AUTOMATISCH/MANUELL/UPGRADE)
+  
+  Kann geändert werden (F-05):
+  Alter Sitzplatz wird AVAILABLE (atomar
+  mit Zuweisung neuer Sitzplatz in
+  ACID-Transaktion, F-06).
+end note
+
+' === Maintenance/VIP Block Flow ===
+AVAILABLE --> BLOCKED : block()\n[maintenance OR vip_reservation]\nentry / set_blocked_reason
+
+BLOCKED --> AVAILABLE : unblock()\n[maintenance_complete OR vip_cancelled]
+
+note left of BLOCKED
+  Traceability: (außerhalb Scope)
+  
+  Sitzplatz manuell blockiert für:
+  • Wartung/Reinigung
+  • VIP-Reservierungen
+  • Defekte Sitze
+  
+  Status: BLOCKED (grau)
+  
+  Kann nur durch manuellen
+  unblock() freigegeben werden.
+end note
+
+' === Zentrale Klarstellung (P-01) ===
+note top
+  WICHTIGE KLARSTELLUNG zu ASSIGNING und ROLLBACK_PENDING:
+  
+  • Dies sind interne Orchestrator-Zustände
+    (UpgradeSagaOrchestrator.state)
+  
+  • NICHT in Sitzplatz.status-Enum persistiert
+  
+  • Sitzplatz.status-Enum enthält nur:
+    AVAILABLE, RESERVED, ASSIGNED, BLOCKED
+  
+  • Für andere Transaktionen bleibt der Sitzplatz
+    während ASSIGNING im Zustand RESERVED
+    (geschützt durch Reservierung)
+  
+  • Prozess-Zustände (ASSIGNING, ROLLBACK_PENDING)
+    existieren nur im UpgradeSagaOrchestrator.state
+  
+  Grund:
+  - Verhindert Race Conditions zwischen
+    gleichzeitigen Upgrade-Versuchen und
+    regulären Zuweisungen
+  - Saubere Trennung zwischen Domänen-Zustand
+    (Sitzplatz.status) und Prozess-Zustand
+    (Orchestrator.state)
+end note
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-01: Automatische Zuweisung
+  • F-02: Manuelle Zuweisung
+  • F-05: Sitzplatz ändern
+  • F-06: Alter Sitzplatz freigeben
+  • F-07: Upgrade zwischen Klassen
+  • F-08: Reserve-Payment-Confirm Flow (TTL=120s)
+  • N-06: RBAC (Supervisor-Autorisierung)
+  • N-07: Saga-Pattern mit Kompensation
+  
+  ---
+  
+  **Farbcodierung:**
+  • Grün (AVAILABLE) = Frei
+  • Gelb (RESERVED) = Temporär reserviert
+  • Gold (ASSIGNING) = Zahlung läuft (Orchestrator)
+  • Rot (ASSIGNED) = Zugewiesen
+  • Grau (BLOCKED) = Blockiert
+  • Orange (ROLLBACK_PENDING) = Rollback (Orchestrator)
+  
+  ---
+  
+  **Guards:**
+  • [seat_available]: Sitzplatz verfügbar
+  • [supervisor_authorized]: RBAC-Prüfung (N-06)
+  • [payment_success]: Zahlung erfolgreich
+  • [within_ttl]: Innerhalb 120s
+  • [after(120s)]: Timeout-Event (TTLTimer)
+  • [atomic]: Atomare Operation (N-02)
+  
+  ---
+  
+  **Entry/Exit-Aktionen:**
+  • entry / Beim Eintritt in Zustand
+  • do / Während im Zustand
+  • exit / Beim Verlassen des Zustands
+  
+  ---
+  
+  **Besonderheiten:**
+  • ASSIGNING/ROLLBACK_PENDING:
+    Orchestrator-Zustände (nicht in DB)
+  • ACID-Transaktionen: Atomare Übergänge
+    verhindern Race Conditions (N-02)
+  • TTL-Timer: Automatischer Timeout nach 120s
+  • EXPIRED-Status: In Reservierung.status
+    parallel zu Sitzplatz.status=AVAILABLE
+end legend
+
+@enduml

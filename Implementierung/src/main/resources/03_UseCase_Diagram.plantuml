@@ -1,0 +1,161 @@
+@startuml Use_Case_Diagram_Sitzplatzverwaltung
+
+' Titel
+title Use Case Diagram - Sitzplatzverwaltung am Check-in-Schalter\n(Airbus A350-900, LHR→SIN)
+
+' Styling
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecaseBackgroundColor WhiteSmoke
+skinparam usecaseBorderColor DarkSlateGray
+skinparam actorBackgroundColor LightSkyBlue
+skinparam actorBorderColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+
+' === Akteure ===
+actor "Check-in-Agent" as Agent <<actor>>
+actor "Supervisor" as Supervisor <<actor>>
+actor "Buchungssystem" as BookingSystem <<external>>
+actor "Zahlungssystem" as PaymentSystem <<external>>
+
+' Vererbungsbeziehung
+Supervisor -up-|> Agent
+
+' Notiz zur Supervisor-Rolle
+note right of Supervisor
+  **Supervisor erbt alle Rechte 
+  von CheckInAgent + 
+  Upgrade-Autorisierung**
+end note
+
+' === System-Boundary ===
+rectangle "Sitzplatzverwaltungssystem" {
+
+  ' === Use Cases ===
+  usecase "UC1: Sitzplatz zuweisen\n(automatisch oder manuell)" as UC1
+  usecase "UC2: Sitzplatz ändern" as UC2
+  usecase "UC3: Upgrade durchführen" as UC3
+  
+  ' === Inkludierte Use Cases ===
+  usecase "UC_SitzplanVisualisierung" as UC_Sitzplan <<boundary>>
+  usecase "UC_SupervisorAutorisierung" as UC_Auth
+  usecase "UC_ZahlungAbwickeln" as UC_Payment <<external>>
+
+  ' === Includes-Beziehungen ===
+  UC1 .down.> UC_Sitzplan : <<includes>>
+  UC2 .down.> UC_Sitzplan : <<includes>>
+  UC3 .down.> UC_Sitzplan : <<includes>>
+  UC3 .> UC_Auth : <<includes>>
+  UC3 .> UC_Payment : <<includes>>
+
+}
+
+' === Akteur-Use-Case-Assoziationen ===
+Agent --> UC1
+Agent --> UC2
+Supervisor --> UC3
+
+BookingSystem --> UC1 : <<liefert\nPassagierdaten>>
+PaymentSystem --> UC3 : <<authorisiert\nZahlung>>
+
+' === Notizen zu Use Cases ===
+note right of UC1
+  **Traceability:** F-01, F-02
+  
+  **Constraint F-03:** 
+  System MUSS Doppelzuweisungen 
+  durch ACID-Transaktionen verhindern
+  
+  **Alternative Flow (F-04):** 
+  Check-in ohne Sitzplatz:
+  Wenn keine Sitzplätze verfügbar 
+  → Bordkarte mit "Sitzplatz am Gate"
+end note
+
+note right of UC2
+  **Traceability:** F-05, F-06
+  
+  Ermöglicht Änderung eines 
+  bereits zugewiesenen Sitzplatzes 
+  innerhalb derselben Klasse
+end note
+
+note bottom of UC3
+  **Traceability:** F-07, F-08, N-07
+  
+  Upgrade zwischen Klassen mit:
+  • Supervisor-Autorisierung (N-06)
+  • Reserve-Payment-Confirm Flow (F-08)
+  • TTL-basierte Reservierung (120s)
+  • Saga-Pattern für Kompensation (N-07)
+end note
+
+' === Notizen zu inkludierten Use Cases (NEU) ===
+note left of UC_Sitzplan
+  **Traceability:** N-05
+  
+  Grafische Darstellung des 
+  Sitzplans mit Echtzeit-Status
+  (grün/rot/gelb/grau)
+end note
+
+note right of UC_Auth
+  **Traceability:** N-06
+  
+  RBAC-Prüfung: Nur Supervisor 
+  darf Upgrades autorisieren
+end note
+
+note right of UC_Payment
+  **Traceability:** F-08
+  
+  Orchestrierung der Zahlung 
+  mit externem Zahlungssystem
+  (Reserve-Payment-Confirm Flow)
+end note
+
+' === Globale Qualitätsanforderungen (NFRs) ===
+note as NFRs
+  **Globale Qualitätsanforderungen:**
+  
+  • **N-01:** Antwortzeit ≤2s (P95) 
+    für Zuweisungen bei 50 parallelen Check-ins
+  
+  • **N-02:** ACID-Transaktionen (SERIALIZABLE) 
+    für kritische Operationen 
+    (Zuweisung, Änderung, Upgrade-Commit)
+  
+  • **N-03:** Task-Zeit ≤30s 
+    (inkl. Passagiersuche) für Usability
+  
+  • **N-04:** Verschlüsselung 
+    at-rest (AES-256) und 
+    in-transit (TLS 1.2+) 
+    für Passagierdaten
+end note
+
+' Positionierung der NFRs oben rechts
+NFRs -[hidden]up- Supervisor
+
+' === Legende ===
+legend right
+  **Sitzplatz-Status (für State Diagram):**
+  • <color:green>Grün</color> = AVAILABLE
+  • <color:red>Rot</color> = ASSIGNED
+  • <color:gold>Gelb</color> = RESERVED
+  • <color:gray>Grau</color> = BLOCKED
+  
+  ---
+  
+  **Stereotypen:**
+  • <<actor>> – Menschliche Akteure
+  • <<external>> – Externe Systeme
+  • <<boundary>> – UI-Komponenten
+  • <<control>> – Services/Orchestrator
+  • <<entity>> – Domänenobjekte
+  • <<timer>> – Zeitbasierte Events
+  • <<encrypted>> – Verschlüsselte Daten
+end legend
+
+@enduml

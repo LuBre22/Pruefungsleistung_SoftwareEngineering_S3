@@ -1,0 +1,420 @@
+@startuml SD1_Sitzplatz_Zuweisen_Corrected
+
+' Titel
+title Sequence Diagram SD1 - Sitzplatz zuweisen (automatisch oder manuell)\n(mit Überbuchungs-Fallback) - Korrigiert
+
+' Styling
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBackgroundColor WhiteSmoke
+skinparam sequenceParticipantBorderColor DarkSlateGray
+skinparam sequenceActorBackgroundColor LightSkyBlue
+skinparam sequenceActorBorderColor Navy
+skinparam sequenceLifeLineBorderColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam boxPadding 10
+
+' === Participants ===
+actor "Check-in-Agent" as Agent <<actor>>
+participant "CheckInUI" as UI <<boundary>>
+participant "SitzplatzService" as Service <<control>>
+participant "BuchungsClient" as BookingClient <<control>>
+participant "Buchungssystem" as BookingSystem <<external>>
+participant "SitzplatzRepository" as SeatRepo <<entity>>
+participant "BordkartenService" as BoardingPass <<control>>
+
+' === Sequence Start ===
+Agent -> UI: start_checkin(passenger_id)
+activate UI
+
+note right of UI
+  **Traceability:** F-01, F-02
+  
+  Agent startet Check-in-Prozess
+  für Passagier.
+  
+  **Korrektur (2025-11-14):**
+  Database-Teilnehmer entfernt,
+  alle DB-Interaktionen über Repository.
+end note
+
+' === Passagierdaten abrufen ===
+UI -> BookingClient: get_passenger_data(passenger_id)
+activate BookingClient
+
+BookingClient -> BookingSystem: GET /bookings/{passenger_id}
+activate BookingSystem
+
+note right of BookingSystem
+  **Traceability:** F-01, F-04
+  
+  Externes Buchungssystem liefert
+  Passagierdaten (PNR, Klasse, etc.).
+  
+  <<external, encrypted>> (N-04)
+end note
+
+BookingSystem --> BookingClient: booking_data(pnr, cabin_class, name)
+deactivate BookingSystem
+BookingClient --> UI: passenger_found(booking_data)
+deactivate BookingClient
+
+' === Prüfung vorab zugewiesener Sitzplatz ===
+UI -> Service: check_existing_assignment(passenger_id)
+activate Service
+
+Service -> SeatRepo: find_assignment_by_passenger(passenger_id)
+activate SeatRepo
+
+note right of SeatRepo
+  Repository kapselt DB-Zugriff:
+  Intern: SELECT * FROM assignments
+  WHERE passenger_id=?
+end note
+
+SeatRepo --> Service: assignment_or_null
+deactivate SeatRepo
+
+alt seat_already_assigned
+  
+  note right of Service
+    Passagier hat bereits einen
+    Sitzplatz (z. B. bei Online-Check-in).
+    
+    Kein weiterer Prozess nötig.
+  end note
+  
+  Service --> UI: seat_already_assigned(seat_number)
+  UI --> Agent: "Sitzplatz bereits zugewiesen: {seat_number}"
+  deactivate Service
+  deactivate UI
+  
+else no_seat_assigned
+  
+  note right of Service
+    **Traceability:** F-01, F-02
+    
+    Passagier hat noch keinen Sitzplatz →
+    Automatische oder manuelle Zuweisung.
+  end note
+  
+  Service --> UI: no_assignment_found
+  
+  ' === Entscheidung: Auto vs. Manuell ===
+  UI -> Agent: ask_assignment_mode()
+  Agent --> UI: mode_selection(AUTO|MANUAL)
+  
+  alt mode=AUTO
+    
+    note right of UI
+      **Traceability:** F-01
+      
+      Automatische Zuweisung:
+      System wählt ersten verfügbaren
+      Sitzplatz in gebuchter Klasse.
+    end note
+    
+    UI -> Service: assign_seat_auto(passenger_id, cabin_class, mitarbeiter_id)
+    
+    Service -> SeatRepo: find_available_seats(cabin_class)
+    activate SeatRepo
+    
+    note right of SeatRepo
+      Repository kapselt DB-Zugriff:
+      Intern: SELECT * FROM seats
+      WHERE cabin_class=?
+      AND status='AVAILABLE'
+      ORDER BY row, column
+      LIMIT 1
+    end note
+    
+    alt seats_available
+      
+      SeatRepo --> Service: first_available_seat
+      deactivate SeatRepo
+      
+      note right of Service
+        **Traceability:** F-03, N-02
+        
+        Kritischer Bereich:
+        ACID-Transaktion verhindert
+        Doppelzuweisungen.
+      end note
+      
+      ' === Critical Region: ACID-Transaktion ===
+      group critical [ACID-Transaktion: Sitzplatzzuweisung]
+        
+        Service -> SeatRepo: begin_transaction(SERIALIZABLE)
+        activate SeatRepo #LightGray
+        
+        note right of SeatRepo
+          Repository startet Transaktion:
+          Intern: BEGIN TRANSACTION (SERIALIZABLE)
+        end note
+        
+        Service -> SeatRepo: check_and_lock_seat(seat_number)
+        
+        note right of SeatRepo
+          Repository sperrt Sitzplatz:
+          Intern: SELECT * FROM seats
+          WHERE seat_number=? FOR UPDATE
+        end note
+        
+        SeatRepo --> Service: seat_locked
+        
+        Service -> SeatRepo: assign_seat(seat_number, passenger_id, mitarbeiter_id, zeitstempel, grund=AUTOMATISCH)
+        
+        note right of SeatRepo
+          **Audit-Attribute (Compliance):**
+          • mitarbeiter_id='LuBre22' (wer)
+          • zeitstempel='2025-11-14 14:57:02' (wann)
+          • grund='AUTOMATISCH' (warum)
+          
+          Intern:
+          UPDATE seats SET status='ASSIGNED'
+          WHERE seat_number=?
+          
+          INSERT INTO assignments (...)
+        end note
+        
+        Service -> SeatRepo: commit_transaction()
+        
+        note right of SeatRepo
+          Repository committed Transaktion:
+          Intern: COMMIT
+        end note
+        
+        SeatRepo --> Service: transaction_committed
+        deactivate SeatRepo
+        
+      end
+      
+      Service -> BoardingPass: generate_boarding_pass(passenger_id, seat_number, cabin_class)
+      activate BoardingPass
+      BoardingPass --> Service: boarding_pass_created
+      deactivate BoardingPass
+      
+      Service --> UI: success(seat_number)
+      UI --> Agent: "Sitzplatz zugewiesen: {seat_number}"
+      
+    else no_seats_available
+      
+      note right of SeatRepo
+        **Traceability:** F-04
+        
+        Überbuchung: Keine Sitzplätze
+        in gebuchter Klasse verfügbar.
+        
+        Alternative: Bordkarte mit
+        "Sitzplatz am Gate".
+      end note
+      
+      SeatRepo --> Service: no_seats_available
+      deactivate SeatRepo
+      
+      Service -> BoardingPass: generate_boarding_pass_no_seat(passenger_id, cabin_class, reason="OVERBOOKED")
+      activate BoardingPass
+      BoardingPass --> Service: boarding_pass_created
+      deactivate BoardingPass
+      
+      note right of BoardingPass
+        Bordkarte enthält:
+        "Sitzplatz wird am Gate zugewiesen"
+        
+        Keine Sitzplatzzuweisung persistiert.
+        Sitzplätze bleiben AVAILABLE.
+      end note
+      
+      Service --> UI: no_seat_available
+      UI --> Agent: "Überbuchung: Sitzplatz am Gate"
+      
+    end
+    
+  else mode=MANUAL
+    
+    note right of UI
+      **Traceability:** F-02, N-05
+      
+      Manuelle Zuweisung:
+      Agent wählt Sitzplatz aus
+      Sitzplan-Visualisierung.
+    end note
+    
+    UI -> Service: get_available_seats(cabin_class)
+    Service -> SeatRepo: find_available_seats(cabin_class)
+    activate SeatRepo
+    
+    note right of SeatRepo
+      Repository kapselt DB-Zugriff:
+      Intern: SELECT * FROM seats
+      WHERE cabin_class=?
+      AND status='AVAILABLE'
+    end note
+    
+    alt seats_available
+      
+      SeatRepo --> Service: available_seats_list
+      deactivate SeatRepo
+      
+      Service --> UI: seat_map(available_seats)
+      
+      note right of UI
+        **Traceability:** N-05
+        
+        Sitzplan-Visualisierung:
+        Grün = AVAILABLE
+        Rot = ASSIGNED
+        Gelb = RESERVED
+        Grau = BLOCKED
+      end note
+      
+      UI --> Agent: show_seat_map(cabin_class)
+      Agent -> UI: select_seat(seat_number)
+      
+      UI -> Service: assign_seat_manual(passenger_id, seat_number, mitarbeiter_id)
+      
+      ' === Critical Region: ACID-Transaktion (Manuell) ===
+      group critical [ACID-Transaktion: Manuelle Zuweisung]
+        
+        Service -> SeatRepo: begin_transaction(SERIALIZABLE)
+        activate SeatRepo #LightGray
+        
+        Service -> SeatRepo: check_and_lock_seat(seat_number)
+        
+        note right of SeatRepo
+          Repository sperrt Sitzplatz:
+          Intern: SELECT FOR UPDATE
+        end note
+        
+        alt seat_still_available
+          
+          SeatRepo --> Service: seat_locked
+          
+          Service -> SeatRepo: assign_seat(seat_number, passenger_id, mitarbeiter_id, zeitstempel, grund=MANUELL)
+          
+          note right of SeatRepo
+            **Audit-Attribute:**
+            grund=MANUELL
+            
+            Intern: UPDATE seats, INSERT assignments
+          end note
+          
+          Service -> SeatRepo: commit_transaction()
+          SeatRepo --> Service: transaction_committed
+          deactivate SeatRepo
+          
+          Service -> BoardingPass: generate_boarding_pass(passenger_id, seat_number, cabin_class)
+          activate BoardingPass
+          BoardingPass --> Service: boarding_pass_created
+          deactivate BoardingPass
+          
+          Service --> UI: success(seat_number)
+          UI --> Agent: "Sitzplatz zugewiesen: {seat_number}"
+          
+        else seat_taken_in_meantime
+          
+          note right of SeatRepo
+            **Traceability:** F-03
+            
+            Race Condition: Sitzplatz wurde
+            zwischen Anzeige und Auswahl
+            von anderem Agent zugewiesen.
+          end note
+          
+          SeatRepo --> Service: seat_already_assigned
+          
+          Service -> SeatRepo: rollback_transaction()
+          
+          note right of SeatRepo
+            Repository rollt Transaktion zurück:
+            Intern: ROLLBACK
+          end note
+          
+          SeatRepo --> Service: transaction_rolled_back
+          deactivate SeatRepo
+          
+          Service --> UI: error("Sitzplatz bereits vergeben")
+          UI --> Agent: "Bitte anderen Sitzplatz wählen"
+          
+        end
+        
+      end
+      
+    else no_seats_available
+      
+      note right of SeatRepo
+        **Traceability:** F-04
+        
+        Überbuchung auch bei
+        manueller Zuweisung.
+      end note
+      
+      SeatRepo --> Service: no_seats_available
+      deactivate SeatRepo
+      
+      Service -> BoardingPass: generate_boarding_pass_no_seat(passenger_id, cabin_class, reason="OVERBOOKED")
+      activate BoardingPass
+      BoardingPass --> Service: boarding_pass_created
+      deactivate BoardingPass
+      
+      Service --> UI: no_seat_available
+      UI --> Agent: "Überbuchung: Sitzplatz am Gate"
+      
+    end
+    
+  end
+  
+end
+
+deactivate Service
+deactivate UI
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-01: Automatische Zuweisung
+  • F-02: Manuelle Zuweisung
+  • F-03: Doppelzuweisung verhindern (ACID)
+  • F-04: Check-in ohne Sitzplatz (Überbuchung)
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  • N-04: Verschlüsselte Passagierdaten
+  • N-05: Sitzplan-Visualisierung
+  
+  ---
+  
+  **Sitzplatz-Status:**
+  • <color:green>AVAILABLE</color> = Frei
+  • <color:red>ASSIGNED</color> = Zugewiesen
+  
+  ---
+  
+  **Stereotypen:**
+  • <<actor>> – Menschliche Akteure
+  • <<boundary>> – UI-Komponenten
+  • <<control>> – Services
+  • <<entity>> – Repositories (kapseln DB-Zugriff)
+  • <<external>> – Externe Systeme
+  
+  ---
+  
+  **Besonderheiten:**
+  • **Repository-Pattern:** Alle DB-Interaktionen
+    (BEGIN TRANSACTION, SELECT FOR UPDATE,
+    COMMIT, ROLLBACK) sind im Repository gekapselt
+  • **Abstraktion:** Service-Schicht kennt keine
+    DB-Details, nur Repository-Schnittstelle
+  • **Audit-Attribute:** mitarbeiter_id,
+    zeitstempel, grund (AUTOMATISCH/MANUELL)
+  • **Überbuchungs-Fallback:** Bordkarte
+    mit "Sitzplatz am Gate" (F-04)
+  
+  ---
+  
+  **Korrektur (2025-11-14 14:57:02):**
+  • Database-Teilnehmer entfernt
+  • Alle DB-Interaktionen über SeatRepo
+  • Konsistent mit SD4 (Repository-Pattern)
+  • User: LuBre22
+end legend
+
+@enduml

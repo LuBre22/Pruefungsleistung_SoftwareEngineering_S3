@@ -1,0 +1,592 @@
+@startuml AD3_Upgrade_Durchfuehren_v4_Final
+
+' Titel
+title Activity Diagram AD3 - Upgrade durchführen (v4)\n(Saga-Pattern: Reserve-Payment-Confirm Flow mit TTL=120s)
+
+' Styling
+skinparam activityBackgroundColor WhiteSmoke
+skinparam activityBorderColor DarkSlateGray
+skinparam activityDiamondBackgroundColor LightYellow
+skinparam activityDiamondBorderColor Orange
+skinparam activityStartColor LightSkyBlue
+skinparam activityEndColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam partitionBorderColor Navy
+skinparam partitionBackgroundColor AliceBlue
+
+' === Swimlanes ===
+|Agent (Supervisor)|
+start
+
+:Wähle "Upgrade durchführen"\nfür Passagier;
+
+note right
+  **Traceability:** F-07, F-08, N-06
+  
+  Agent (Supervisor) initiiert Upgrade-Prozess
+  für Passagier mit Ziel-Sitzplatz
+  in höherer Kabinenklasse.
+  
+  Datum: 2025-11-14 14:32:44
+  User: LuBre22
+end note
+
+|System (UpgradeSagaOrchestrator)|
+
+' === RBAC-Prüfung ===
+:Prüfe Supervisor-Autorisierung;
+
+note right
+  **Traceability:** N-06
+  
+  RBAC-Prüfung:
+  SELECT rolle FROM mitarbeiter
+  WHERE mitarbeiter_id='LuBre22'
+  
+  Nur Supervisor darf
+  Upgrades autorisieren.
+end note
+
+if (Agent ist\nSupervisor?) then (Ja)
+  
+  note right
+    Rolle: Supervisor
+    Autorisierung erfolgreich.
+  end note
+  
+  :Lade aktuelle Zuweisung\ndes Passagiers;
+  
+  note right
+    SELECT * FROM assignments
+    WHERE passenger_id=?
+    
+    Ermittlung:
+    • old_seat_number
+    • old_cabin_class
+  end note
+  
+  ' === Prüfung Zuweisung existiert ===
+  if (Zuweisung\nexistiert?) then (Ja)
+    
+    note right
+      Passagier hat bereits
+      einen zugewiesenen Sitzplatz.
+      Upgrade kann durchgeführt werden.
+    end note
+    
+    |Agent (Supervisor)|
+    
+    :Wähle Ziel-Sitzplatz\nin höherer Klasse;
+    
+    note right
+      Agent wählt aus Sitzplan:
+      • target_seat_number
+      • target_cabin_class
+      
+      Constraint: target_cabin_class
+      muss höher sein als old_cabin_class.
+    end note
+    
+    |System (UpgradeSagaOrchestrator)|
+    
+    ' === Validierung Upgrade-Richtung ===
+    :Validiere:\nZiel-Klasse höher\nals aktuelle Klasse;
+    
+    note right
+      **Constraint F-07:**
+      
+      Business = 1
+      PremiumEconomy = 2
+      Economy = 3
+      
+      Prüfung:
+      target_cabin_class < old_cabin_class
+      (numerisch)
+      
+      Nur Upgrade erlaubt,
+      kein Downgrade.
+    end note
+    
+    if (Upgrade-Richtung\nvalide?) then (Ja)
+      
+      :Prüfe Verfügbarkeit\nZiel-Sitzplatz;
+      
+      note right
+        SELECT * FROM seats
+        WHERE seat_number=target_seat
+        AND cabin_class=target_cabin_class
+        AND status='AVAILABLE'
+      end note
+      
+      if (Ziel-Sitzplatz\nverfügbar?) then (Ja)
+        
+        partition "**Saga Step 1: Reserve** (TTL=120s)" #LightYellow {
+          
+          note right
+            **Traceability:** F-08
+            
+            Temporäre Reservierung erstellen:
+            • TTL=120 Sekunden
+            • Status=RESERVED
+            • Automatischer Timeout
+          end note
+          
+          |TTLTimer|
+          
+          :Starte TTL-Timer\n(120 Sekunden);
+          
+          note right
+            TTLTimer.reserve_seat()
+            
+            Automatische Freigabe nach 120s,
+            wenn Zahlung nicht erfolgreich.
+            
+            Status: <color:gold>RESERVED</color>
+          end note
+          
+          |Database|
+          
+          :Setze Ziel-Sitzplatz\n→ RESERVED;
+          
+          note right
+            UPDATE seats
+            SET status='RESERVED'
+            WHERE seat_number=target_seat
+          end note
+          
+          :Erstelle Reservierung\n(TTL, PENDING);
+          
+          note right
+            INSERT INTO reservierung (
+              reservation_id=UUID(),
+              seat_number=target_seat,
+              status='PENDING',
+              ttl_expires_at=NOW()+120s
+            )
+          end note
+          
+        }
+        
+        partition "**Saga Step 2: Payment**" #LightBlue {
+          
+          note right
+            **Traceability:** F-08
+            
+            Zahlungsabwicklung mit
+            Correlation-ID für Idempotenz.
+          end note
+          
+          |System (UpgradeSagaOrchestrator)|
+          
+          :Berechne Upgrade-Gebühr;
+          
+          note right
+            upgrade_fee = calculate_upgrade_fee(
+              old_cabin_class,
+              target_cabin_class
+            )
+            
+            Beispiel:
+            • Economy → PremiumEconomy: 150 EUR
+            • Economy → Business: 250 EUR
+            • PremiumEconomy → Business: 100 EUR
+          end note
+          
+          :Initiiere Zahlung\n(mit Correlation-ID);
+          
+          note right
+            ZahlungsClient.authorize_payment(
+              upgrade_fee=250.00,
+              correlation_id=UUID()
+            )
+            
+            POST /authorize
+            → Externes Zahlungssystem
+          end note
+          
+          |Zahlungssystem|
+          
+          :Verarbeite Zahlung\n(asynchron);
+          
+          note right
+            Zahlungssystem verarbeitet
+            Kreditkarte/PayPal/etc.
+            
+            Parallel läuft TTL-Timer (120s).
+            
+            Race zwischen:
+            • Zahlung erfolgreich
+            • Zahlung fehlgeschlagen
+            • Timer abgelaufen
+          end note
+          
+          ' === Zahlungsergebnis (3 Pfade) ===
+          if (Zahlungsergebnis?) then (Erfolg innerhalb 120s)
+            
+            note right
+              **Traceability:** F-07, F-08, N-02
+              
+              Zahlung erfolgreich →
+              Atomare ACID-Transaktion für Commit.
+            end note
+            
+            |TTLTimer|
+            
+            :Stoppe Timer;
+            
+            partition "**Saga Step 3: Commit** <<critical>>" #LightGray {
+              
+              note right
+                **Traceability:** N-02
+                
+                Atomare ACID-Transaktion:
+                • release_old_seat (F-06)
+                • assign_new_seat (F-07)
+                • update_assignment (Audit)
+                
+                Kein Zwischenzustand mit
+                zwei Sitzplätzen!
+              end note
+              
+              |Database|
+              
+              :BEGIN TRANSACTION\n(SERIALIZABLE);
+              
+              :Setze alten Sitzplatz\n→ AVAILABLE;
+              
+              note right
+                **Traceability:** F-06
+                
+                UPDATE seats
+                SET status='AVAILABLE'
+                WHERE seat_number=old_seat
+              end note
+              
+              :Setze Ziel-Sitzplatz\n→ ASSIGNED;
+              
+              note right
+                UPDATE seats
+                SET status='ASSIGNED'
+                WHERE seat_number=target_seat
+              end note
+              
+              :Aktualisiere Zuweisung\n(Audit-Attribute);
+              
+              note right
+                **Audit-Attribute:**
+                
+                UPDATE assignments SET
+                • seat_number=target_seat
+                • mitarbeiter_id='LuBre22' (wer)
+                • zeitstempel='2025-11-14 14:32:44' (wann)
+                • grund='UPGRADE' (warum)
+                WHERE passenger_id=?
+                
+                **Hinweis:**
+                Kabinenklasse (cabin_class) ergibt sich
+                implizit aus target_seat.cabin_class
+                (Sitzplatz.cabin_class im Klassendiagramm).
+                
+                Zuweisung-Entität hat kein cabin_class-Attribut.
+              end note
+              
+              :COMMIT;
+              
+              |System (UpgradeSagaOrchestrator)|
+              
+              :Lösche Reservierung\n(Cleanup);
+              
+              note right
+                **Cleanup:**
+                
+                DELETE FROM reservierung
+                WHERE reservation_id=?
+                
+                Verhindert Zombie-Objekte.
+              end note
+              
+              :Aktualisiere Bordkarte;
+              
+              note right
+                BordkartenService.update_boarding_pass()
+                • Neue Kabinenklasse
+                • Neuer Sitzplatz
+                • Upgrade-Hinweis
+              end note
+              
+            }
+            
+            |Agent (Supervisor)|
+            
+            #LightGreen:Bestätigung:\n"Upgrade erfolgreich:\n{old_seat} ({old_class})\n→ {target_seat} ({target_class})\nGebühr: {upgrade_fee} EUR\nPassagier: {name}";
+            
+          elseif (Zahlung fehlgeschlagen) then (Ja)
+            
+            note right
+              **Traceability:** N-07
+              
+              Zahlung fehlgeschlagen →
+              Saga-Kompensation (Rollback).
+            end note
+            
+            |TTLTimer|
+            
+            :Stoppe Timer;
+            
+            partition "**Saga Compensation: Rollback**" #LightCoral {
+              
+              note right
+                **Traceability:** N-07
+                
+                Kompensation:
+                • Reservierung löschen
+                • Sitzplatz freigeben
+                • SagaLog aktualisieren
+              end note
+              
+              |Database|
+              
+              :Setze Ziel-Sitzplatz\n→ AVAILABLE;
+              
+              note right
+                UPDATE seats
+                SET status='AVAILABLE'
+                WHERE seat_number=target_seat
+              end note
+              
+              :Lösche Reservierung;
+              
+              note right
+                DELETE FROM reservierung
+                WHERE reservation_id=?
+              end note
+              
+              |System (UpgradeSagaOrchestrator)|
+              
+              :Protokolliere Fehler\nin SagaLog;
+              
+              note right
+                INSERT INTO saga_log (
+                  saga_id,
+                  step='PAYMENT_FAILED',
+                  status='COMPENSATED',
+                  timestamp='2025-11-14 14:32:44'
+                )
+              end note
+              
+            }
+            
+            |Agent (Supervisor)|
+            
+            #LightCoral:Fehlermeldung:\n"Upgrade fehlgeschlagen:\nZahlung abgelehnt.\n\nAlter Sitzplatz {old_seat}\n({old_class}) bleibt unverändert.\n\nPassagier: {name}";
+            
+          else (Timeout nach 120s)
+            
+            note right
+              **Traceability:** F-08
+              
+              TTL-Timer abgelaufen →
+              Automatische Kompensation.
+            end note
+            
+            |TTLTimer|
+            
+            :Timer abgelaufen:\nAuto-Kompensation;
+            
+            partition "**Auto-Compensation: Timeout**" #LightCoral {
+              
+              |Database|
+              
+              :Setze Reservierung\n→ EXPIRED;
+              
+              note right
+                UPDATE reservierung
+                SET status='EXPIRED'
+                WHERE reservation_id=?
+              end note
+              
+              :Setze Ziel-Sitzplatz\n→ AVAILABLE;
+              
+              note right
+                UPDATE seats
+                SET status='AVAILABLE'
+                WHERE seat_number=target_seat
+              end note
+              
+              |System (UpgradeSagaOrchestrator)|
+              
+              :Protokolliere Timeout\nin SagaLog;
+              
+              note right
+                INSERT INTO saga_log (
+                  saga_id,
+                  step='PAYMENT_TIMEOUT',
+                  status='COMPENSATED',
+                  timestamp='2025-11-14 14:32:44'
+                )
+              end note
+              
+            }
+            
+            |Agent (Supervisor)|
+            
+            #LightCoral:Fehlermeldung:\n"Upgrade fehlgeschlagen:\nZahlung Timeout (>120s).\n\nAlter Sitzplatz {old_seat}\n({old_class}) bleibt unverändert.\n\nPassagier: {name}";
+            
+          endif
+          
+        }
+        
+      else (Nein)
+        
+        note right
+          **Traceability:** F-03
+          
+          Konflikt: Ziel-Sitzplatz bereits
+          von anderem Prozess reserviert
+          (Race Condition verhindert).
+        end note
+        
+        |Agent (Supervisor)|
+        
+        #LightCoral:Fehlermeldung:\n"Ziel-Sitzplatz {target_seat}\nbereits reserviert oder vergeben.\n\nBitte anderen Sitzplatz wählen.";
+        
+      endif
+      
+    else (Nein)
+      
+      note right
+        **Fehlerfall:**
+        Ziel-Klasse ist nicht höher
+        als aktuelle Klasse.
+        
+        Downgrade nicht erlaubt.
+      end note
+      
+      |Agent (Supervisor)|
+      
+      #LightCoral:Fehlermeldung:\n"Upgrade-Richtung ungültig:\nAktuell: {old_class}\nZiel: {target_class}\n\nNur Upgrade (höhere Klasse) erlaubt.\nKein Downgrade möglich.";
+      
+    endif
+    
+  else (Nein)
+    
+    note right
+      Passagier hat noch keinen
+      zugewiesenen Sitzplatz.
+      
+      Upgrade kann nicht durchgeführt werden,
+      da kein "alter Sitzplatz" existiert.
+    end note
+    
+    |Agent (Supervisor)|
+    
+    #LightCoral:Fehlermeldung:\n"Upgrade nicht möglich:\nPassagier hat noch keinen\nSitzplatz zugewiesen.\n\nBitte zuerst Check-in durchführen\n(UC1: Sitzplatz zuweisen).";
+    
+    stop
+    
+  endif
+  
+else (Nein)
+  
+  note right
+    **Traceability:** N-06
+    
+    RBAC-Fehler: Agent ist kein
+    Supervisor → Upgrade verweigert.
+  end note
+  
+  |Agent (Supervisor)|
+  
+  #LightCoral:Fehlermeldung:\n"403 Forbidden:\nSupervisor-Autorisierung erforderlich.\n\nAktueller User: LuBre22\nRolle: CheckInAgent\n\nBitte Supervisor kontaktieren.";
+  
+  stop
+  
+endif
+
+' === Merge Point ===
+note right
+  **Single Exit Point für Saga-Flow**
+  
+  Alle **Saga-Pfade** (Success, Failure, Timeout)
+  führen zum gemeinsamen Endknoten (stop).
+  
+  **Pre-Condition-Fehler** haben frühe Exit Points:
+  • Agent ist nicht Supervisor (unauthorized)
+  • Passagier hat keine Zuweisung
+  
+  Diese **Exceptional Flows** enden vor dem Saga-Start
+  (Guard-Bedingungen nicht erfüllt).
+  
+  Saga-Pattern garantiert:
+  • Entweder vollständiges Commit (Success)
+  • Oder vollständige Kompensation (Failure/Timeout)
+  • Niemals inkonsistenter Zustand
+  
+  **Änderungshistorie v4:**
+  • Kritik 2 (zweite Iteration): Note präzisiert
+  • Klarstellung: SEP nur für Saga-Flow, Pre-Conditions frühe Exits
+end note
+
+stop
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-06: Freigabe alter Sitzplatz
+  • F-07: Upgrade zwischen Klassen
+  • F-08: Reserve-Payment-Confirm Flow (TTL=120s)
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  • N-06: RBAC (Supervisor-Autorisierung)
+  • N-07: Saga-Pattern mit Kompensation
+  
+  ---
+  
+  **Sitzplatz-Status:**
+  • <color:green>AVAILABLE</color> = Frei
+  • <color:gold>RESERVED</color> = Temporär reserviert
+  • <color:red>ASSIGNED</color> = Zugewiesen
+  
+  ---
+  
+  **Swimlanes:**
+  • Agent (Supervisor): Autorisierter Supervisor (LuBre22)
+  • System (UpgradeSagaOrchestrator): Orchestrator
+  • TTLTimer: Zeitbasierte Events
+  • Zahlungssystem: Externe Zahlung
+  • Database: Persistenz-Schicht
+  
+  ---
+  
+  **Saga-Pattern (N-07):**
+  • **Step 1: Reserve** - Temporäre Reservierung (TTL=120s)
+  • **Step 2: Payment** - Asynchrone Zahlung
+  • **Step 3: Commit** - Atomare ACID-Transaktion
+  • **Compensation** - Bei Fehler/Timeout: Rollback
+  
+  ---
+  
+  **Besonderheiten:**
+  • **RBAC-Gate:** Supervisor-Autorisierung (N-06)
+  • **TTL-Timer:** Automatischer Timeout nach 120s
+  • **Correlation-ID:** Idempotenz bei Payment-Retries
+  • **Atomare Transaktion:** release_old_seat +
+    assign_new_seat + update_assignment in EINER TX
+  • **Cleanup:** Reservierung nach Erfolg löschen
+  • **SagaLog:** Audit-Log für Debugging (N-07)
+  • **Single Exit Point (Saga):** Alle Saga-Pfade
+    zu einem Endknoten; Pre-Conditions frühe Exits
+  
+  ---
+  
+  **Änderungen v3 → v4 (2025-11-14 14:32:44):**
+  • Kritik 2 (zweite Iteration): Note präzisiert
+  • Klarstellung: SEP nur für Saga-Flow
+  • Pre-Condition-Fehler (unauthorized, keine Zuweisung)
+    haben frühe Exit Points (Exceptional Flows)
+  
+  **Erstellt:** 2025-11-14 14:32:44 UTC
+  **User:** LuBre22
+end legend
+
+@enduml

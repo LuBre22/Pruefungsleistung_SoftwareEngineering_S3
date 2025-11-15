@@ -1,0 +1,296 @@
+@startuml SD3_Parallele_Zuweisung_Corrected
+
+' Titel
+title Sequence Diagram SD3 - Parallele Sitzplatzzuweisung\n(ACID-Test: Doppelzuweisung verhindern) - Korrigiert
+
+' Styling
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBackgroundColor WhiteSmoke
+skinparam sequenceParticipantBorderColor DarkSlateGray
+skinparam sequenceActorBackgroundColor LightSkyBlue
+skinparam sequenceActorBorderColor Navy
+skinparam sequenceLifeLineBorderColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam boxPadding 10
+
+' === Participants ===
+actor "Agent 1" as Agent1 <<actor>>
+actor "Agent 2" as Agent2 <<actor>>
+participant "SitzplatzService" as Service <<control>>
+participant "SitzplatzRepository" as SeatRepo <<entity>>
+
+' === Parallel Start ===
+note across
+  **Traceability:** F-03, N-02
+  
+  **Szenario:** Zwei Agents versuchen **gleichzeitig**,
+  denselben Sitzplatz (12A) zuzuweisen.
+  
+  **Erwartung:** System MUSS Doppelzuweisung durch
+  ACID-Transaktionen (SERIALIZABLE) verhindern.
+  
+  **Korrektur (2025-11-14):**
+  Database-Teilnehmer entfernt,
+  alle DB-Interaktionen über Repository.
+end note
+
+par Agent 1 versucht Zuweisung
+  
+  Agent1 -> Service: assign_seat(passenger_1, seat_12A, agent1_id, correlation_id_1)
+  activate Service
+  
+  note right of Service
+    **Agent 1 startet Transaktion**
+    
+    Correlation-ID: correlation_id_1
+    Passagier: passenger_1
+    Sitzplatz: 12A
+  end note
+  
+  Service -> SeatRepo: begin_transaction(SERIALIZABLE)
+  activate SeatRepo #LightBlue
+  
+  note right of SeatRepo
+    Repository startet Transaktion:
+    Intern: BEGIN TRANSACTION (SERIALIZABLE)
+  end note
+  
+  Service -> SeatRepo: check_and_lock_seat(seat_12A)
+  
+  note right of SeatRepo
+    **Database Lock erworben**
+    
+    Agent 1 erhält exklusiven Lock
+    auf Sitzplatz 12A.
+    
+    Intern: SELECT * FROM seats
+    WHERE seat_number='12A'
+    FOR UPDATE
+    
+    Isolation Level: SERIALIZABLE
+  end note
+  
+  SeatRepo --> Service: seat_locked(status=AVAILABLE)
+  
+else Agent 2 versucht Zuweisung (gleichzeitig)
+  
+  Agent2 -> Service: assign_seat(passenger_2, seat_12A, agent2_id, correlation_id_2)
+  activate Service
+  
+  note right of Service
+    **Agent 2 startet Transaktion**
+    
+    Correlation-ID: correlation_id_2
+    Passagier: passenger_2
+    Sitzplatz: 12A (derselbe!)
+  end note
+  
+  Service -> SeatRepo: begin_transaction(SERIALIZABLE)
+  activate SeatRepo #LightCoral
+  
+  note right of SeatRepo
+    Repository startet Transaktion:
+    Intern: BEGIN TRANSACTION (SERIALIZABLE)
+  end note
+  
+  Service -> SeatRepo: check_and_lock_seat(seat_12A)
+  
+  note right of SeatRepo
+    **Agent 2 wartet auf Lock**
+    
+    Lock wird von Agent 1 gehalten.
+    Agent 2 blockiert bis Lock frei.
+    
+    Intern: SELECT FOR UPDATE wartet
+    
+    Timeout-Schutz: z. B. 5 Sekunden
+  end note
+  
+end
+
+' === Agent 1 führt Zuweisung durch ===
+Service -> SeatRepo: assign_seat(seat_12A, passenger_1, agent1_id, zeitstempel, grund=MANUELL)
+
+note right of SeatRepo
+  **Agent 1 führt Zuweisung durch**
+  
+  Intern:
+  UPDATE seats
+  SET status='ASSIGNED'
+  WHERE seat_number='12A'
+  
+  INSERT INTO assignments (
+    passenger_id='passenger_1',
+    seat_number='12A',
+    mitarbeiter_id='agent1_id',
+    zeitstempel=NOW(),
+    grund='MANUELL',
+    correlation_id='correlation_id_1'
+  )
+  
+  Sitzplatz 12A →
+  status=<color:red>ASSIGNED</color>
+end note
+
+Service -> SeatRepo: commit_transaction()
+
+note right of SeatRepo
+  Repository committed Transaktion:
+  Intern: COMMIT
+end note
+
+SeatRepo --> Service: transaction_committed
+deactivate SeatRepo
+
+Service --> Agent1: success(seat_12A)
+deactivate Service
+
+note right of Agent1
+  **Agent 1: Erfolg**
+  
+  Sitzplatz 12A erfolgreich
+  zugewiesen an passenger_1.
+end note
+
+' === Agent 2: Lock wird frei, aber Sitzplatz bereits vergeben ===
+SeatRepo --> Service: seat_locked(status=ASSIGNED)
+
+note right of SeatRepo
+  **Lock freigegeben**
+  
+  Agent 2 erhält jetzt den Lock,
+  aber Sitzplatz ist bereits ASSIGNED.
+  
+  Intern: SELECT FOR UPDATE
+  liefert status='ASSIGNED'
+end note
+
+Service -> SeatRepo: rollback_transaction()
+
+note right of SeatRepo
+  **Traceability:** F-03
+  
+  Konflikt erkannt:
+  Sitzplatz wurde zwischen
+  Prüfung und Lock-Erhalt
+  von Agent 1 zugewiesen.
+  
+  Repository rollt zurück:
+  Intern: ROLLBACK
+end note
+
+SeatRepo --> Service: transaction_rolled_back
+deactivate SeatRepo
+
+Service --> Agent2: error("Sitzplatz bereits vergeben")
+deactivate Service
+
+note right of Agent2
+  **Agent 2: Fehler**
+  
+  Sitzplatz 12A bereits vergeben.
+  Kein Doppelzuweisungs-Problem!
+  
+  System fordert Agent auf,
+  anderen Sitzplatz zu wählen.
+end note
+
+' === Optional: Agent 1 Retry mit Idempotenz ===
+note across
+  **Optional: Idempotenz-Test**
+  
+  Wenn Agent 1 dieselbe Correlation-ID nochmals sendet
+  (z. B. bei Netzwerkfehler/Retry), erkennt das System
+  die Duplikation und gibt success zurück (keine Doppelbuchung).
+end note
+
+Agent1 -> Service: assign_seat(passenger_1, seat_12A, agent1_id, correlation_id_1) [RETRY]
+activate Service
+
+Service -> SeatRepo: check_idempotency(correlation_id_1)
+activate SeatRepo
+
+note right of SeatRepo
+  Repository prüft Idempotenz:
+  Intern: SELECT * FROM assignments
+  WHERE correlation_id=?
+end note
+
+SeatRepo --> Service: already_processed(seat_12A, passenger_1)
+deactivate SeatRepo
+
+note right of Service
+  **Idempotenz:**
+  
+  Correlation-ID bereits verarbeitet.
+  System gibt success zurück,
+  ohne Duplikat zu erstellen.
+end note
+
+Service --> Agent1: success(seat_12A) [IDEMPOTENT]
+deactivate Service
+
+note right of Agent1
+  **Agent 1: Idempotentes Retry**
+  
+  Kein neuer Assignment-Eintrag.
+  System erkennt Duplikat.
+end note
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-03: Doppelzuweisung verhindern
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  
+  ---
+  
+  **ACID-Mechanismen:**
+  • **SELECT FOR UPDATE:** Exklusiver Lock
+  • **SERIALIZABLE Isolation:** Höchster
+    Isolation Level (verhindert Phantom Reads)
+  • **Correlation-ID:** Idempotenz-Schutz
+    bei Retries
+  
+  ---
+  
+  **Ablauf:**
+  1. Agent 1 erhält Lock → Zuweisung → COMMIT
+  2. Agent 2 wartet auf Lock → Sitzplatz
+     bereits vergeben → ROLLBACK
+  3. Agent 1 Retry mit derselben Correlation-ID
+     → Idempotenz erkannt → success ohne
+     Duplikat
+  
+  ---
+  
+  **Stereotypen:**
+  • <<actor>> – Menschliche Akteure
+  • <<control>> – Services
+  • <<entity>> – Repositories (kapseln DB-Zugriff)
+  
+  ---
+  
+  **Besonderheiten:**
+  • **Repository-Pattern:** Alle DB-Interaktionen
+    (BEGIN TRANSACTION, SELECT FOR UPDATE,
+    UPDATE, INSERT, COMMIT, ROLLBACK)
+    sind im Repository gekapselt
+  • **Abstraktion:** Service-Schicht kennt
+    keine DB-Details, nur Repository-Schnittstelle
+  • **Konsistent mit SD4:** Alle Sequenzdiagramme
+    verwenden dasselbe Abstraktionsniveau
+  
+  ---
+  
+  **Korrektur (2025-11-14 14:57:02):**
+  • Database-Teilnehmer entfernt
+  • Alle DB-Interaktionen über SeatRepo
+  • begin_transaction(), commit_transaction(),
+    rollback_transaction() als Repository-Methoden
+  • Konsistent mit SD1, SD2, SD4
+  • User: LuBre22
+end legend
+
+@enduml

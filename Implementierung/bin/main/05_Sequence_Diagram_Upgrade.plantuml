@@ -1,0 +1,333 @@
+@startuml SD4_Upgrade_Saga
+
+' Titel
+title Sequence Diagram SD4 - Upgrade durchführen (Saga-Pattern)\n(Reserve-Payment-Confirm Flow mit TTL=120s)
+
+' Styling
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBackgroundColor WhiteSmoke
+skinparam sequenceParticipantBorderColor DarkSlateGray
+skinparam sequenceActorBackgroundColor LightSkyBlue
+skinparam sequenceActorBorderColor Navy
+skinparam sequenceLifeLineBorderColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam boxPadding 10
+
+' === Participants ===
+actor "Check-in-Agent" as Agent <<actor>>
+participant "SupervisorUI" as UI <<boundary>>
+participant "UpgradeSagaOrchestrator" as Orchestrator <<control>>
+participant "SitzplatzRepository" as SeatRepo <<entity>>
+participant "ReservierungRepository" as ReservationRepo <<entity>>
+participant "TTLTimer" as Timer <<timer>>
+participant "ZahlungsClient" as PaymentClient <<control>>
+participant "ZahlungsService" as PaymentService <<external>>
+participant "BordkartenService" as BoardingPass <<control>>
+
+' === Sequence Start ===
+Agent -> UI: initiate_upgrade(passenger_id, target_seat)
+activate UI
+
+note right of UI
+  **Traceability:** F-07, F-08
+  
+  Agent initiiert Upgrade-Prozess
+  für Passagier mit Ziel-Sitzplatz.
+end note
+
+UI -> Orchestrator: check_supervisor_role(agent_id)
+activate Orchestrator
+
+note right of Orchestrator
+  **Traceability:** N-06
+  
+  RBAC-Prüfung: Nur Supervisor
+  darf Upgrades autorisieren.
+end note
+
+' === Alt-Fragment: Autorisierung ===
+alt authorized
+  
+  Orchestrator --> UI: role_check_success
+  
+  ' === Verfügbarkeitsprüfung ===
+  Orchestrator -> SeatRepo: check_availability(target_seat)
+  activate SeatRepo
+  SeatRepo --> Orchestrator: availability_status
+  deactivate SeatRepo
+  
+  ' === Alt-Fragment: Seat Verfügbarkeit ===
+  alt seat_available
+    
+    note right of Orchestrator
+      **Traceability:** F-08
+      
+      Sitzplatz verfügbar →
+      Temporäre Reservierung erstellen
+      (TTL=120s, Status=RESERVED)
+    end note
+    
+    ' === Reservierung erstellen ===
+    Orchestrator -> Timer: reserve_seat(target_seat, TTL=120s, reservation_id)
+    activate Timer
+    Timer --> Orchestrator: reservation_created
+    
+    note right of Timer
+      TTL-Timer gestartet:
+      Automatische Freigabe nach 120s,
+      wenn Zahlung nicht erfolgreich.
+      
+      Status: <color:gold>RESERVED</color>
+    end note
+    
+    Orchestrator -> ReservationRepo: create_reservation(reservation_id, target_seat, status=PENDING, ttl_expires_at)
+    activate ReservationRepo
+    ReservationRepo --> Orchestrator: reservation_stored
+    deactivate ReservationRepo
+    
+    ' === Zahlungsinitiierung ===
+    Orchestrator -> PaymentClient: authorize_payment(upgrade_fee, correlation_id)
+    activate PaymentClient
+    
+    note right of PaymentClient
+      **Traceability:** F-08
+      
+      Zahlung mit Correlation-ID
+      für Idempotenz (verhindert
+      Doppelbuchung bei Retry).
+    end note
+    
+    PaymentClient -> PaymentService: POST /authorize
+    activate PaymentService
+    
+    ' === Alt-Fragment: Payment-Ergebnis ===
+    alt success within 120s
+      
+      PaymentService --> PaymentClient: 200 OK
+      deactivate PaymentService
+      PaymentClient --> Orchestrator: payment_success
+      deactivate PaymentClient
+      
+      note right of Orchestrator
+        **Traceability:** F-07, F-08, N-02
+        
+        Zahlung erfolgreich →
+        Atomare ACID-Transaktion für Commit
+        (Kein Zwischenzustand mit zwei Sitzplätzen)
+      end note
+      
+      ' === Critical Region: Atomare Transaktion ===
+      group critical [ACID-Transaktion: Atomares Upgrade-Commit]
+        
+        Orchestrator -> SeatRepo: BEGIN TRANSACTION
+        activate SeatRepo #LightGray
+        
+        Orchestrator -> SeatRepo: release_old_seat(old_seat)
+        note right of SeatRepo
+          **Traceability:** F-06
+          
+          Alter Sitzplatz →
+          status=<color:green>AVAILABLE</color>
+        end note
+        
+        Orchestrator -> SeatRepo: assign_new_seat(target_seat, passenger_id)
+        note right of SeatRepo
+          Neuer Sitzplatz →
+          status=<color:red>ASSIGNED</color>
+        end note
+        
+        Orchestrator -> SeatRepo: update_assignment(passenger_id, target_seat, mitarbeiter_id, zeitstempel, grund=UPGRADE)
+        note right of SeatRepo
+          **Audit-Attribute (Compliance):**
+          • mitarbeiter_id (wer)
+          • zeitstempel (wann)
+          • grund=UPGRADE (warum)
+        end note
+        
+        Orchestrator -> SeatRepo: COMMIT
+        SeatRepo --> Orchestrator: transaction_committed
+        deactivate SeatRepo
+        
+        note right of Orchestrator
+          **Atomare Transaktion:**
+          Kein Zwischenzustand möglich.
+          Beide Sitzplätze (alt + neu)
+          werden in EINER Transaktion
+          aktualisiert.
+        end note
+        
+      end
+      
+      ' === Cleanup nach erfolgreichem Commit ===
+      Orchestrator -> Timer: cancel_timer(reservation_id)
+      Timer --> Orchestrator: timer_cancelled
+      deactivate Timer
+      
+      Orchestrator -> ReservationRepo: delete_reservation(reservation_id)
+      activate ReservationRepo
+      ReservationRepo --> Orchestrator: reservation_deleted
+      deactivate ReservationRepo
+      
+      note right of ReservationRepo
+        **Cleanup:**
+        Reservierung wird nach
+        erfolgreichem Upgrade gelöscht
+        (kein Zombie-Objekt).
+      end note
+      
+      ' === Bordkarte aktualisieren ===
+      Orchestrator -> BoardingPass: update(new_class, target_seat)
+      activate BoardingPass
+      BoardingPass --> Orchestrator: boarding_pass_updated
+      deactivate BoardingPass
+      
+      Orchestrator --> UI: success(new_seat, new_class)
+      UI --> Agent: "Upgrade erfolgreich"
+      
+    else failure
+      
+      PaymentService --> PaymentClient: 400 Error
+      deactivate PaymentService
+      PaymentClient --> Orchestrator: payment_failed
+      deactivate PaymentClient
+      
+      note right of Orchestrator
+        **Traceability:** N-07
+        
+        Zahlung fehlgeschlagen →
+        Saga-Kompensation (Rollback)
+      end note
+      
+      ' === Rollback-Pfad ===
+      Orchestrator -> Timer: cancel_timer(reservation_id)
+      activate Timer
+      Timer --> Orchestrator: timer_cancelled
+      deactivate Timer
+      
+      Orchestrator -> ReservationRepo: delete_reservation(reservation_id)
+      activate ReservationRepo
+      ReservationRepo --> Orchestrator: reservation_deleted
+      deactivate ReservationRepo
+      
+      note right of ReservationRepo
+        **Rollback:**
+        Reservierung löschen,
+        Sitzplatz wieder verfügbar.
+      end note
+      
+      Orchestrator -> SeatRepo: set_seat_status(target_seat, AVAILABLE)
+      activate SeatRepo
+      SeatRepo --> Orchestrator: status_updated
+      deactivate SeatRepo
+      
+      Orchestrator --> UI: error("Zahlung fehlgeschlagen")
+      UI --> Agent: "Upgrade fehlgeschlagen (Zahlung abgelehnt)"
+      
+    else timeout after 120s
+      
+      note right of Timer
+        **Traceability:** F-08
+        
+        TTL-Timer abgelaufen (120s) →
+        Automatische Kompensation
+      end note
+      
+      Timer -> Orchestrator: timer_expired(reservation_id)
+      activate Orchestrator #LightCoral
+      
+      Orchestrator -> ReservationRepo: set_reservation_status(reservation_id, EXPIRED)
+      activate ReservationRepo
+      ReservationRepo --> Orchestrator: status_updated
+      deactivate ReservationRepo
+      
+      Orchestrator -> SeatRepo: set_seat_status(target_seat, AVAILABLE)
+      activate SeatRepo
+      SeatRepo --> Orchestrator: status_updated
+      deactivate SeatRepo
+      
+      note right of SeatRepo
+        Sitzplatz wieder
+        <color:green>AVAILABLE</color>
+        
+        Reservierung.status = EXPIRED
+      end note
+      
+      Orchestrator --> UI: error("Timeout")
+      deactivate Orchestrator
+      UI --> Agent: "Upgrade fehlgeschlagen (Zahlung Timeout)"
+      
+    end
+    
+  else seat_already_reserved
+    
+    note right of Orchestrator
+      **Traceability:** F-03
+      
+      Konflikt: Sitzplatz bereits
+      von anderem Prozess reserviert
+      (Race Condition verhindert).
+    end note
+    
+    Orchestrator --> UI: error("Sitzplatz bereits reserviert")
+    UI --> Agent: "Bitte anderen Sitzplatz wählen"
+    
+  end
+  
+else unauthorized
+  
+  note right of Orchestrator
+    **Traceability:** N-06
+    
+    RBAC-Fehler: Agent ist kein
+    Supervisor → Upgrade verweigert.
+  end note
+  
+  Orchestrator --> UI: 403 Forbidden
+  deactivate Orchestrator
+  UI --> Agent: "Supervisor-Autorisierung erforderlich"
+  
+end
+
+deactivate UI
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-06: Freigabe alter Sitzplatz
+  • F-07: Upgrade zwischen Klassen
+  • F-08: Reserve-Payment-Confirm Flow (TTL=120s)
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  • N-06: RBAC (Supervisor-Autorisierung)
+  • N-07: Saga-Pattern mit Kompensation
+  
+  ---
+  
+  **Sitzplatz-Status:**
+  • <color:green>AVAILABLE</color> = Frei
+  • <color:gold>RESERVED</color> = Temporär reserviert
+  • <color:red>ASSIGNED</color> = Zugewiesen
+  
+  ---
+  
+  **Stereotypen:**
+  • <<actor>> – Menschliche Akteure
+  • <<boundary>> – UI-Komponenten
+  • <<control>> – Services/Orchestrator
+  • <<entity>> – Repositories/Datenzugriff
+  • <<external>> – Externe Systeme
+  • <<timer>> – Zeitbasierte Events
+  
+  ---
+  
+  **Besonderheiten:**
+  • **Critical-Block:** Atomare ACID-Transaktion
+    (release_old_seat + assign_new_seat
+    + update_assignment in EINER Transaktion)
+  • **Correlation-ID:** Idempotenz-Schutz
+    bei Zahlungs-Retries
+  • **TTL-Timer:** Automatische Freigabe
+    nach 120s ohne erfolgreiche Zahlung
+end legend
+
+@enduml

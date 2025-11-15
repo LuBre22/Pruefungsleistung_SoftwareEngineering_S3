@@ -1,0 +1,267 @@
+@startuml SD2_Sitzplatz_Aendern_Corrected
+
+' Titel
+title Sequence Diagram SD2 - Sitzplatz ändern\n(Freigabe alter Sitzplatz + Zuweisung neuer Sitzplatz) - Korrigiert
+
+' Styling
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBackgroundColor WhiteSmoke
+skinparam sequenceParticipantBorderColor DarkSlateGray
+skinparam sequenceActorBackgroundColor LightSkyBlue
+skinparam sequenceActorBorderColor Navy
+skinparam sequenceLifeLineBorderColor Navy
+skinparam noteBackgroundColor LightYellow
+skinparam noteBorderColor Orange
+skinparam boxPadding 10
+
+' === Participants ===
+actor "Check-in-Agent" as Agent <<actor>>
+participant "CheckInUI" as UI <<boundary>>
+participant "SitzplatzService" as Service <<control>>
+participant "SitzplatzRepository" as SeatRepo <<entity>>
+participant "BordkartenService" as BoardingPass <<control>>
+
+' === Sequence Start ===
+Agent -> UI: request_seat_change(passenger_id)
+activate UI
+
+note right of UI
+  **Traceability:** F-05, F-06
+  
+  Agent möchte Sitzplatz für
+  Passagier ändern (innerhalb
+  derselben Klasse).
+  
+  **Korrektur (2025-11-14):**
+  Database-Teilnehmer entfernt,
+  alle DB-Interaktionen über Repository.
+end note
+
+' === Aktuelle Zuweisung abrufen ===
+UI -> Service: get_current_assignment(passenger_id)
+activate Service
+
+Service -> SeatRepo: find_assignment(passenger_id)
+activate SeatRepo
+
+note right of SeatRepo
+  Repository kapselt DB-Zugriff:
+  Intern: SELECT * FROM assignments
+  WHERE passenger_id=?
+end note
+
+SeatRepo --> Service: assignment(old_seat, cabin_class)
+deactivate SeatRepo
+
+Service --> UI: current_seat(old_seat_number, cabin_class)
+
+' === Sitzplan anzeigen ===
+UI -> Service: get_available_seats(cabin_class)
+Service -> SeatRepo: find_available_seats(cabin_class)
+activate SeatRepo
+
+note right of SeatRepo
+  **Traceability:** N-05
+  
+  Sitzplan-Visualisierung:
+  Zeigt verfügbare Sitzplätze
+  in derselben Klasse.
+  
+  Intern: SELECT * FROM seats
+  WHERE cabin_class=?
+  AND status='AVAILABLE'
+end note
+
+SeatRepo --> Service: available_seats_list
+deactivate SeatRepo
+
+Service --> UI: seat_map(available_seats, current_seat)
+UI --> Agent: show_seat_map(cabin_class, current=old_seat)
+
+' === Agent wählt neuen Sitzplatz ===
+Agent -> UI: select_new_seat(new_seat_number)
+
+note right of Agent
+  Agent wählt neuen Sitzplatz
+  aus Sitzplan-Visualisierung.
+end note
+
+UI -> Service: change_seat(passenger_id, old_seat, new_seat, mitarbeiter_id)
+
+' === Critical Region: Atomare ACID-Transaktion ===
+group critical [ACID-Transaktion: Atomare Sitzplatzänderung]
+  
+  note right of Service
+    **Traceability:** F-06, N-02
+    
+    Atomare Transaktion:
+    • Alter Sitzplatz → AVAILABLE (F-06)
+    • Neuer Sitzplatz → ASSIGNED
+    • Zuweisung aktualisieren
+    
+    Kein Zwischenzustand möglich!
+  end note
+  
+  Service -> SeatRepo: begin_transaction(SERIALIZABLE)
+  activate SeatRepo #LightGray
+  
+  note right of SeatRepo
+    Repository startet Transaktion:
+    Intern: BEGIN TRANSACTION (SERIALIZABLE)
+  end note
+  
+  ' === Prüfung neuer Sitzplatz ===
+  Service -> SeatRepo: check_and_lock_seat(new_seat)
+  
+  note right of SeatRepo
+    Repository sperrt neuen Sitzplatz:
+    Intern: SELECT * FROM seats
+    WHERE seat_number=? FOR UPDATE
+  end note
+  
+  alt new_seat_available
+    
+    SeatRepo --> Service: seat_locked
+    
+    ' === Alter Sitzplatz freigeben (F-06) ===
+    Service -> SeatRepo: release_seat(old_seat)
+    
+    note right of SeatRepo
+      **Traceability:** F-06
+      
+      Alter Sitzplatz wird freigegeben
+      → status=<color:green>AVAILABLE</color>
+      
+      Intern: UPDATE seats
+      SET status='AVAILABLE'
+      WHERE seat_number=?
+    end note
+    
+    ' === Neuer Sitzplatz zuweisen ===
+    Service -> SeatRepo: assign_seat(new_seat, passenger_id)
+    
+    note right of SeatRepo
+      Neuer Sitzplatz →
+      status=<color:red>ASSIGNED</color>
+      
+      Intern: UPDATE seats
+      SET status='ASSIGNED'
+      WHERE seat_number=?
+    end note
+    
+    ' === Zuweisung aktualisieren (Audit) ===
+    Service -> SeatRepo: update_assignment(passenger_id, new_seat, mitarbeiter_id, zeitstempel, grund=MANUELL)
+    
+    note right of SeatRepo
+      **Audit-Attribute (Compliance):**
+      • mitarbeiter_id='LuBre22' (wer)
+      • zeitstempel='2025-11-14 14:57:02' (wann)
+      • grund='MANUELL' (warum)
+      
+      Intern: UPDATE assignments SET
+      seat_number=?, mitarbeiter_id=?,
+      zeitstempel=?, grund=?
+      WHERE passenger_id=?
+    end note
+    
+    Service -> SeatRepo: commit_transaction()
+    
+    note right of SeatRepo
+      Repository committed Transaktion:
+      Intern: COMMIT
+    end note
+    
+    SeatRepo --> Service: transaction_committed
+    deactivate SeatRepo
+    
+    ' === Bordkarte aktualisieren ===
+    Service -> BoardingPass: update_boarding_pass(passenger_id, new_seat)
+    activate BoardingPass
+    BoardingPass --> Service: boarding_pass_updated
+    deactivate BoardingPass
+    
+    Service --> UI: success(new_seat)
+    UI --> Agent: "Sitzplatz geändert: {old_seat} → {new_seat}"
+    
+  else new_seat_already_taken
+    
+    note right of SeatRepo
+      **Traceability:** F-03
+      
+      Race Condition: Neuer Sitzplatz
+      wurde zwischen Anzeige und Auswahl
+      von anderem Agent zugewiesen.
+    end note
+    
+    SeatRepo --> Service: seat_already_assigned
+    
+    Service -> SeatRepo: rollback_transaction()
+    
+    note right of SeatRepo
+      Repository rollt Transaktion zurück:
+      Intern: ROLLBACK
+      
+      Alter Sitzplatz bleibt ASSIGNED.
+      Keine Änderung durchgeführt.
+    end note
+    
+    SeatRepo --> Service: transaction_rolled_back
+    deactivate SeatRepo
+    
+    Service --> UI: error("Neuer Sitzplatz bereits vergeben")
+    UI --> Agent: "Bitte anderen Sitzplatz wählen"
+    
+  end
+  
+end
+
+deactivate Service
+deactivate UI
+
+' === Legende ===
+legend right
+  **Traceability:**
+  • F-05: Sitzplatz ändern
+  • F-06: Alter Sitzplatz freigeben
+  • N-02: ACID-Transaktionen (SERIALIZABLE)
+  • N-05: Sitzplan-Visualisierung
+  
+  ---
+  
+  **Sitzplatz-Status:**
+  • <color:green>AVAILABLE</color> = Frei
+  • <color:red>ASSIGNED</color> = Zugewiesen
+  
+  ---
+  
+  **Stereotypen:**
+  • <<actor>> – Menschliche Akteure
+  • <<boundary>> – UI-Komponenten
+  • <<control>> – Services
+  • <<entity>> – Repositories (kapseln DB-Zugriff)
+  
+  ---
+  
+  **Besonderheiten:**
+  • **Repository-Pattern:** Alle DB-Interaktionen
+    (BEGIN TRANSACTION, SELECT FOR UPDATE,
+    UPDATE, COMMIT, ROLLBACK) sind im
+    Repository gekapselt
+  • **Atomare Transaktion:** Freigabe alter
+    + Zuweisung neuer Sitzplatz in EINER
+    Transaktion (keine Zwischenzustände)
+  • **Audit-Attribute:** mitarbeiter_id,
+    zeitstempel, grund=MANUELL
+  • **Abstraktion:** Service-Schicht kennt
+    keine DB-Details
+  
+  ---
+  
+  **Korrektur (2025-11-14 14:57:02):**
+  • Database-Teilnehmer entfernt
+  • Alle DB-Interaktionen über SeatRepo
+  • Konsistent mit SD4 (Repository-Pattern)
+  • User: LuBre22
+end legend
+
+@enduml

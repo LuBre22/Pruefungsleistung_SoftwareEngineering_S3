@@ -1,0 +1,5 @@
+Entwickeln Sie ein Softwaresystem zur Sitzplatzverwaltung am Check-in-Schalter für einen Flug mit einem Airbus A350-900 von London nach Singapore. Das System muss die Anwendungsfälle Zuweisung, Änderung und Upgrade von Sitzplätzen ausschließlich für den Check-in vor Ort am Flughafen abbilden.
+
+Setzen Sie das System in Java 21 LTS um unter Nutzung moderner Sprachfeatures und Integration von Lombok zur Reduktion von Boilerplate-Code. Die Entwicklung soll auf bereitgestellten UML-Diagrammen basieren und muss unbedingt mit diesen konsistent sein.
+
+Es handelt sich letztendlich um ein Lernprojekt, nicht um eine Produktiventwicklung, weshalb der Scope bewusst begrenzt ist. Es sollte darauf geachtet werden, dass sich bei der Implementierung kein Scope-Creep oder Overengineering einschleicht.
